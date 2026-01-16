@@ -103,6 +103,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
   m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
+
+  // Asynchronous host <-> device memcpy
+  m.def("async_memcpy_d2h(Tensor src, Tensor! dst) -> ()");
+  m.impl("async_memcpy_d2h", torch::kCUDA, &async_memcpy_d2h);
+  m.def("async_memcpy_h2d(Tensor src, Tensor! dst) -> ()");
+  m.impl("async_memcpy_h2d", torch::kCUDA, &async_memcpy_h2d);
+  
   m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
   m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
 

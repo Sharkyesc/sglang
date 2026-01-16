@@ -129,6 +129,8 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    # CPU attention
+    "cpu_attention",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
@@ -540,6 +542,8 @@ class ServerArgs:
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
+    enable_profiler: bool = False
+    profiler_output_dir: str = "./profiler_output"
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     enable_fused_qk_norm_rope: bool = False
@@ -3645,6 +3649,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.triton_attention_split_tile_size,
             help="The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference.",
+        )
+        parser.add_argument(
+            "--enable-profiler",
+            action="store_true",
+            default=ServerArgs.enable_profiler,
+            help="Enable PyTorch Profiler to analyze async KV cache offloading. Output will be saved to --profiler-output-dir.",
+        )
+        parser.add_argument(
+            "--profiler-output-dir",
+            type=str,
+            default=ServerArgs.profiler_output_dir,
+            help="Directory to save profiler trace files. Default: ./profiler_output",
         )
         parser.add_argument(
             "--num-continuous-decode-steps",

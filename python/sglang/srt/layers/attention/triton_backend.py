@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.cpu_kv_cache import CPUKVCache
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
@@ -19,6 +20,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     next_power_of_2,
 )
+from sgl_kernel.async_memcpy import async_memcpy_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -71,6 +73,7 @@ class TritonAttnBackend(AttentionBackend):
 
         super().__init__()
 
+        # 不 disable 的话会被 TorchDynamo 尝试 capture 成 graph
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
@@ -173,6 +176,236 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         self.cuda_graph_custom_mask = None
+
+        self.num_layers = model_runner.model_config.num_hidden_layers
+        max_cache_size = model_runner.model_config.context_len * 2
+        self.cpu_kv_caches = [
+            CPUKVCache(
+                max_cache_size=max_cache_size,
+                page_size=model_runner.page_size,
+                num_kv_heads=self.num_kv_head,
+                head_dim=model_runner.model_config.head_dim,
+                v_head_dim=self.v_head_dim,
+                dtype=torch.float32,
+                pin_memory=True,
+            )
+            for _ in range(self.num_layers)
+        ]
+
+        self.transfer_stream = torch.cuda.Stream(device=self.device) if torch.cuda.is_available() else None
+    
+
+        # {layer_id: {"k_cpu": Tensor, "v_cpu": Tensor, "cache_slots_cpu": Tensor, "event": torch.cuda.Event}}
+        self.pending_transfers = {}
+        self.transfer_events = {}
+
+    def _async_transfer_kv_to_cpu_cache(
+        self,
+        layer_id: int,
+        k_gpu: torch.Tensor,
+        v_gpu: torch.Tensor,
+        cache_slots: torch.Tensor,
+        layer: "RadixAttention",
+    ):
+        """
+        异步将 KV cache 传输到 CPU，在独立的 CUDA stream 中执行传输，
+        在 FFN 计算时并行进行，不阻塞主计算流。
+
+        Args:
+            layer_id: 层 ID
+            k_gpu: [num_tokens, tp_k_head_num * qk_head_dim] 或 [batch, num_heads, head_dim], GPU
+            v_gpu: [num_tokens, tp_k_head_num * v_head_dim] 或 [batch, num_heads, head_dim], GPU
+            cache_slots: [num_tokens], GPU, 缓存位置索引
+            layer: RadixAttention layer
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return
+
+        if self.transfer_stream is None:
+            return
+
+        if layer_id not in self.transfer_events:
+            self.transfer_events[layer_id] = torch.cuda.Event()
+
+        # 在独立的 stream 中执行 offload
+        with torch.cuda.stream(self.transfer_stream):
+
+            # 准备 K tensor
+            k = k_gpu.detach()
+            if k.ndim == 3:
+                B, H, D = k.shape
+                k = k.reshape(B, H * D)
+            if k.ndim == 2:
+                T, embed = k.shape
+                expected = layer.tp_k_head_num * layer.qk_head_dim
+                if embed != expected:
+                    raise RuntimeError(
+                        f"K embed size mismatch: got {embed}, expected {expected}"
+                    )
+                k = k.reshape(T, layer.tp_k_head_num, layer.qk_head_dim)
+
+            k_fp32 = k.float().contiguous()
+
+            # 准备 V tensor
+            v = v_gpu.detach()
+            if v.ndim == 3:
+                B, H, D = v.shape
+                v = v.reshape(B, H * D)
+            if v.ndim == 2:
+                T, embed = v.shape
+                expected = layer.tp_k_head_num * layer.v_head_dim
+                if embed != expected:
+                    raise RuntimeError(
+                        f"V embed size mismatch: got {embed}, expected {expected}"
+                    )
+                v = v.reshape(T, layer.tp_k_head_num, layer.v_head_dim)
+
+            v_fp32 = v.float().contiguous()
+
+            # 在 CPU 端分配 pinned 内存
+            k_cpu = torch.empty_like(k_fp32, device="cpu", pin_memory=True)
+            v_cpu = torch.empty_like(v_fp32, device="cpu", pin_memory=True)
+
+            # 使用单独 CUDA 文件中的异步拷贝实现进行传输
+            async_memcpy_d2h(k_fp32, k_cpu)
+            async_memcpy_d2h(v_fp32, v_cpu)
+
+            cache_slots_contiguous = cache_slots.contiguous()
+            cache_slots_cpu = torch.empty_like(
+                cache_slots_contiguous, device="cpu", pin_memory=True
+            )
+            async_memcpy_d2h(cache_slots_contiguous, cache_slots_cpu)
+
+            # 记录传输完成事件
+            self.transfer_events[layer_id].record(self.transfer_stream)
+
+            # 将 CPU tensor 和写入操作保存，等待传输完成后再写入
+            self.pending_transfers[layer_id] = {
+                "k_cpu": k_cpu,
+                "v_cpu": v_cpu,
+                "cache_slots_cpu": cache_slots_cpu,
+                "event": self.transfer_events[layer_id],
+            }
+
+    def wait_for_pending_transfers(self, layer_id: Optional[int] = None):
+        """
+        等待待处理的传输任务完成，并写入 CPU cache。
+        
+        Args:
+            layer_id: 如果指定，只等待该层的传输；否则等待所有层的传输
+        """
+        if self.transfer_stream is None:
+            return
+        
+        if layer_id is not None:
+            if layer_id in self.pending_transfers:
+                transfer_info = self.pending_transfers[layer_id]
+                # 等待传输完成
+                if isinstance(transfer_info, dict) and 'event' in transfer_info:
+                    transfer_info['event'].wait()
+                    # 写入 CPU cache
+                    self._batch_write_kv_to_cpu_cache(
+                        layer_id,
+                        transfer_info['k_cpu'],
+                        transfer_info['v_cpu'],
+                        transfer_info['cache_slots_cpu']
+                    )
+                else:
+                    self.transfer_stream.synchronize()
+                del self.pending_transfers[layer_id]
+        else:
+            if self.pending_transfers:
+                # 等待所有传输完成并写入
+                for lid, transfer_info in self.pending_transfers.items():
+                    if isinstance(transfer_info, dict) and 'event' in transfer_info:
+                        transfer_info['event'].wait()
+                        self._batch_write_kv_to_cpu_cache(
+                            lid,
+                            transfer_info['k_cpu'],
+                            transfer_info['v_cpu'],
+                            transfer_info['cache_slots_cpu']
+                        )
+                    else:
+                        self.transfer_stream.synchronize()
+                self.pending_transfers.clear()
+
+    def _batch_write_kv_to_cpu_cache(
+        self,
+        layer_id: int,
+        k_cpu: torch.Tensor,
+        v_cpu: torch.Tensor,
+        cache_slots: torch.Tensor
+    ):
+        """
+        Args:
+            layer_id: 层 ID
+            k_cpu: [B, N_kv, D], CPU, float32
+            v_cpu: [B, N_kv, D], CPU, float32
+            cache_slots: [B], CPU 或 GPU, 缓存位置索引
+        """
+        if cache_slots.is_cuda:
+            slots_cpu = cache_slots.cpu().long()
+        else:
+            slots_cpu = cache_slots.long()
+        page_size = self.cpu_kv_caches[layer_id].page_size
+        page_ids = slots_cpu // page_size
+        offsets = slots_cpu % page_size
+
+        cpu_cache = self.cpu_kv_caches[layer_id]
+        unique_pages = torch.unique(page_ids)
+
+        for page_id in unique_pages:
+            page_id_int = int(page_id.item())
+            mask = page_ids == page_id
+            page_offsets = offsets[mask]  # [N], N 是该页的 token 数
+            k_page = k_cpu[mask]  # [N, N_kv, D]
+            v_page = v_cpu[mask]  # [N, N_kv, D]
+
+            for i, offset in enumerate(page_offsets):
+                offset_int = int(offset.item())
+                cpu_cache.k_buffer[page_id_int, offset_int] = k_page[i]
+                cpu_cache.v_buffer[page_id_int, offset_int] = v_page[i]
+
+    def _gather_kv_from_pages(
+        self, 
+        layer_id: int, 
+        token_slots: torch.Tensor
+    ):
+        """
+        Args:
+            layer_id: 层 ID
+            token_slots: [total_tokens], GPU, token 位置索引
+        
+        Returns:
+            k_tokens: [total_tokens, N_kv, D], CPU
+            v_tokens: [total_tokens, N_kv, D], CPU
+        """
+        token_slots_cpu = token_slots.cpu().long()
+        page_size = self.cpu_kv_caches[layer_id].page_size
+        page_ids_all = token_slots_cpu // page_size
+        unique_pages = torch.unique(page_ids_all)
+
+        k_pages, v_pages = self.cpu_kv_caches[layer_id].read_pages(unique_pages)  # [num_pages, page_size, N_kv, D]
+
+        k_flat = k_pages.reshape(-1, k_pages.shape[2], k_pages.shape[3])  # [num_pages * page_size, N_kv, D]
+        v_flat = v_pages.reshape(-1, v_pages.shape[2], v_pages.shape[3])
+
+        page_ids_all_long = page_ids_all.long()
+        page_indices_in_unique = torch.searchsorted(unique_pages, page_ids_all_long, right=False)
+        valid_mask = (page_indices_in_unique < len(unique_pages)) & (unique_pages[page_indices_in_unique] == page_ids_all_long)
+        if not torch.all(valid_mask):
+            invalid_indices = torch.where(~valid_mask)[0]
+            missing_pages = page_ids_all_long[invalid_indices].unique()
+            raise RuntimeError(f"Requested slot pages {missing_pages.tolist()} not present in fetched pages")
+        
+        offsets = token_slots_cpu % page_size  # [T]
+        page_starts = page_indices_in_unique * page_size  # [T]
+        local_indices = page_starts + offsets  # [T]
+
+        k_tokens = k_flat[local_indices]  # [total_tokens, N_kv, D]
+        v_tokens = v_flat[local_indices]  # [total_tokens, N_kv, D]
+
+        return k_tokens.contiguous(), v_tokens.contiguous()
 
     def get_num_kv_splits(
         self,
@@ -797,6 +1030,15 @@ class TritonAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
+        
+        # 异步 offload KV cache 到 CPU
+        if k is not None and v is not None and save_kv_cache:
+            cache_slots = forward_batch.out_cache_loc
+            self._async_transfer_kv_to_cpu_cache(
+                layer.layer_id, k, v, cache_slots, layer
+            )
+            # 注意：pending_transfers 已在 _async_transfer_kv_to_cpu_cache 内部设置
+
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -817,9 +1059,10 @@ class TritonAttnBackend(AttentionBackend):
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
-            return self._forward_extend_unified(
+            result = self._forward_extend_unified(
                 q, o, layer, forward_batch, causal, logits_soft_cap, sinks
             )
+            return result
 
         # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:

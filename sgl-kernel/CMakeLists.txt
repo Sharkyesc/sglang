@@ -311,6 +311,7 @@ set(SOURCES
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
     "csrc/kvcacheio/transfer.cu"
+    "csrc/kvcacheio/async_memcpy.cu"
     "csrc/mamba/causal_conv1d.cu"
     "csrc/memory/store.cu"
     "csrc/memory/weak_ref_tensor.cpp"
@@ -407,13 +408,13 @@ else()
 endif()
 
 # mscclpp option
-set(MSCCLPP_USE_CUDA ON)
+set(MSCCLPP_USE_CUDA OFF)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
-add_subdirectory(
-    ${repo-mscclpp_SOURCE_DIR}
-    ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
-)
+# add_subdirectory(
+#     ${repo-mscclpp_SOURCE_DIR}
+#     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
+# )
 
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)

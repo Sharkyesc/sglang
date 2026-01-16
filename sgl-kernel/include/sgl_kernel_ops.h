@@ -566,6 +566,10 @@ void transfer_kv_per_layer(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+// Asynchronous host <-> device memcpy helpers
+void async_memcpy_d2h(const at::Tensor& src, at::Tensor& dst);
+void async_memcpy_h2d(const at::Tensor& src, at::Tensor& dst);
+
 void transfer_kv_per_layer_pf_lf(
     const at::Tensor src_k,
     at::Tensor dst_k,

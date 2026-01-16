@@ -230,3 +230,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("cpu_attention")
+def create_cpu_attention_backend(runner):
+    from sglang.srt.layers.attention.cpu_attention_backend import CPUAttentionBackend
+
+    return CPUAttentionBackend(runner)
