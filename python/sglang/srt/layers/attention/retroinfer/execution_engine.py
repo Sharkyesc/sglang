@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.layers.attention.retroinfer.index_builder import RetroInferIndexBuilder
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -26,6 +27,7 @@ class RetroInferExecutionEngine:
         self.kv_source = kv_source
         self.cpu_store = cpu_store
         self.gpu_runtime = gpu_runtime
+        self.index_builder = RetroInferIndexBuilder(model_runner, kv_source, cpu_store)
 
         self.retrieval_budget = float(os.getenv("SGLANG_RETROINFER_RETRIEVAL_BUDGET", "0.02"))
         self.estimation_budget = float(os.getenv("SGLANG_RETROINFER_ESTIMATION_BUDGET", "0.2"))
@@ -175,6 +177,10 @@ class RetroInferExecutionEngine:
         kv_len = int(torch.min(forward_batch.seq_lens).item()) - 1
         if kv_len <= 0 or kv_len < self._min_seq_len_for_index(cache):
             return False
+
+        for req_pool_idx in session.key:
+            if not self.cpu_store.is_request_ready(req_pool_idx, kv_len):
+                self.index_builder.build_request(req_pool_idx, kv_len + 1)
 
         q_heads = layer.tp_q_head_num
         q_dim = layer.qk_head_dim

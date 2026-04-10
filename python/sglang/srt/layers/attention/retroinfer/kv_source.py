@@ -37,3 +37,14 @@ class SGLangRetroInferKVSource:
             keys.append(k_buf[loc])
             values.append(v_buf[loc])
         return torch.stack(keys, dim=0), torch.stack(values, dim=0)
+
+    def gather_request_layer_tensors(
+        self,
+        req_pool_idx: int,
+        layer_id: int,
+        upto_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k_buf = self.model_runner.token_to_kv_pool.get_key_buffer(layer_id)
+        v_buf = self.model_runner.token_to_kv_pool.get_value_buffer(layer_id)
+        loc = self.get_req_kv_indices(req_pool_idx, upto_len)
+        return k_buf[loc], v_buf[loc]

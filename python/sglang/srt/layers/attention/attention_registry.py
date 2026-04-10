@@ -230,3 +230,16 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+@register_attention_backend("retroinfer")
+def create_retroinfer_backend(runner):
+    from sglang.srt.layers.attention.retroinfer_backend import RetroInferAttnBackend
+
+    return RetroInferAttnBackend(runner)
+
+
+@register_attention_backend("sparse_auto")
+def create_sparse_auto_backend(runner):
+    from sglang.srt.layers.attention.sparse_auto_backend import SparseAutoAttnBackend
+
+    return SparseAutoAttnBackend(runner)

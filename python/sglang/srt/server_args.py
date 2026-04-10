@@ -113,6 +113,7 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
+    "sparse_auto",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -129,6 +130,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "retroinfer",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
@@ -382,6 +384,7 @@ class ServerArgs:
     mm_attention_backend: Optional[str] = None
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
+    sparse_attention_config: str = "{}"
     enable_flashinfer_autotune: bool = False
 
     # Speculative decoding
@@ -2951,6 +2954,15 @@ class ServerArgs:
             default=ServerArgs.nsa_decode_backend,
             type=str,
             choices=NSA_CHOICES,
+        )
+        parser.add_argument(
+            "--sparse-attention-config",
+            default=ServerArgs.sparse_attention_config,
+            type=str,
+            help=(
+                "JSON config for the sparse_auto attention backend, for example "
+                '\'{"dense_fallback_backend":"triton","retroinfer_min_decode_seq_len":4096}\''
+            ),
         )
         parser.add_argument(
             "--enable-flashinfer-autotune",
