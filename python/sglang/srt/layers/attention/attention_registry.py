@@ -237,6 +237,11 @@ def create_retroinfer_backend(runner):
 
     return RetroInferAttnBackend(runner)
 
+@register_attention_backend("h2o")
+def create_h2o_backend(runner):
+    from sglang.srt.layers.attention.h2o_backend import H2OAttnBackend
+
+    return H2OAttnBackend(runner)
 
 @register_attention_backend("sparse_auto")
 def create_sparse_auto_backend(runner):

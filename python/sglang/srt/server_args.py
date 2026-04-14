@@ -114,6 +114,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "nsa",
     "sparse_auto",
+    "h2o",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",

@@ -28,6 +28,7 @@ class SparseAutoConfig:
     retroinfer_min_decode_seq_len: int = 4096
     retroinfer_max_batch_size: int = 8
     nsa_min_seq_len: int = 2048
+    h2o_min_seq_len: int = 2048
     enable_h2o: bool = False
 
     @classmethod
@@ -148,8 +149,22 @@ class SparseAutoSelector:
         return (score, reason)
 
     def _score_h2o(self, profile: SparseRuntimeProfile) -> tuple[float, str]:
+        if profile.speculative:
+            return (-1.0, "speculative decoding uses dense fallback")
+        if profile.is_mla:
+            return (-1.0, "H2O path is currently tuned for non-MLA attention")
+        if profile.max_seq_len < self.config.h2o_min_seq_len:
+            return (-1.0, "context is too short for H2O payoff")
+
         score = 40.0 + min(profile.max_seq_len / 8192.0, 4.0)
-        return (score, "H2O provider enabled")
+        reason = "memory-constrained long-context decode favors H2O"
+        if self.config.memory_budget_mb is not None and self.config.memory_budget_mb <= 6144:
+            score += 8.0
+        if profile.batch_size >= 4:
+            score += 3.0
+        if self.config.target_sparsity is not None:
+            score += 4.0 * max(0.0, min(self.config.target_sparsity, 1.0))
+        return (score, reason)
 
 
 class SparseAutoAttnBackend(AttentionBackend):
@@ -353,7 +368,13 @@ class SparseAutoAttnBackend(AttentionBackend):
 
         if name == "h2o":
             self._availability_cache[name] = False
-            return False
+            try:
+                self._get_backend(name)
+                self._availability_cache[name] = True
+            except Exception as exc:
+                logger.info("Sparse backend %s unavailable: %s", name, exc)
+                self._availability_cache[name] = False
+            return self._availability_cache[name]
 
         try:
             self._get_backend(name)
@@ -386,6 +407,10 @@ class SparseAutoAttnBackend(AttentionBackend):
                 self.model_runner,
                 init_new_workspace=getattr(self.model_runner, "init_new_workspace", False),
             )
+        elif name == "h2o":
+            from sglang.srt.layers.attention.h2o_backend import H2OAttnBackend
+
+            backend = H2OAttnBackend(self.model_runner)
         elif name == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
