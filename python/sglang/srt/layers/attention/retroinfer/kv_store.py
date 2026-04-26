@@ -359,6 +359,8 @@ class RetroInferHiCacheKVStore(RetroInferKVStore):
             append_len = int(device_indices.numel())
             start_pos = expected_start
         if start_pos != expected_start:
+            if expected_start == 0 and start_pos > 0:
+                return self.stage_request_from_device(req_pool_idx, start_pos + append_len)
             raise RuntimeError(
                 "RetroInfer host-only staging requires contiguous chunks "
                 f"(req_pool_idx={req_pool_idx}, start_pos={start_pos}, "

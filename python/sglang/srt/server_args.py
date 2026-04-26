@@ -1678,7 +1678,12 @@ class ServerArgs:
         ) and self.hicache_io_backend == "kernel":
             # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
             if self.decode_attention_backend is None:
-                if not self.use_mla_backend():
+                if (
+                    self.attention_backend == "retroinfer"
+                    or self.prefill_attention_backend == "retroinfer"
+                ):
+                    self.decode_attention_backend = "retroinfer"
+                elif not self.use_mla_backend():
                     self.decode_attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
                     )
@@ -4030,6 +4035,11 @@ class ServerArgs:
             if self.decode_attention_backend
             else self.attention_backend
         )
+        if (
+            prefill_attention_backend_str == "retroinfer"
+            or decode_attention_backend_str == "retroinfer"
+        ):
+            return "retroinfer", "retroinfer"
         return prefill_attention_backend_str, decode_attention_backend_str
 
     def use_mla_backend(self):

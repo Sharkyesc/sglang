@@ -464,6 +464,32 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    global_server_args = get_global_server_args()
+    attention_backend = getattr(global_server_args, "attention_backend", None)
+    if attention_backend in ("retroinfer", "retroinfer_hybrid"):
+        kv_committed_len = req.pop_committed_kv_cache()
+        start_p, end_p = req.pop_overallocated_kv_cache()
+
+        if kv_committed_len > 0:
+            kv_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            tree_cache.token_to_kv_pool_allocator.free(kv_indices)
+
+        if end_p > start_p:
+            kv_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start_p:end_p
+            ]
+            tree_cache.token_to_kv_pool_allocator.free(kv_indices)
+
+        tree_cache.req_to_token_pool.free(req.req_pool_idx)
+        if req.last_node is not None:
+            tree_cache.dec_lock_ref(req.last_node)
+            req.last_node = None
+        req.prefix_indices = []
+        req.cache_protected_len = 0
+        return
+
     if req.last_node is None:
         req.pop_committed_kv_cache()
         req.pop_overallocated_kv_cache()
@@ -473,7 +499,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     tree_cache.cache_finished_req(req, is_insert=is_insert)
     start_p, end_p = req.pop_overallocated_kv_cache()
 
-    global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 

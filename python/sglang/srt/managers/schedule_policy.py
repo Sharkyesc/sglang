@@ -453,6 +453,8 @@ class PrefillAdder:
 
     def add_chunked_req(self, req: Req):
         _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        if _rem_tokens <= 0:
+            return req
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]

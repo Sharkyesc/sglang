@@ -65,7 +65,6 @@ class RetroInferExecutionEngine:
         self._partial_refresh_summary_seen: set[
             tuple[tuple[int, ...], int, int, int, int]
         ] = set()
-
     def _require_host_only_supported(self) -> None:
         page_size = int(getattr(self.model_runner, "page_size", 1))
         if page_size != 1:
@@ -79,11 +78,16 @@ class RetroInferExecutionEngine:
             )
 
     def migrate_extend_batch_to_host(self, forward_batch) -> None:
-        """Move just-computed extend KV to host and release its GPU slots.
+        """Move just-computed extend KV to host.
 
         Called after the final layer has written the extend chunk into the normal
         SGLang KV pool. The request's full KV source of truth then becomes the
-        host pool, while the GPU slots can be reused as transient staging space.
+        host pool.
+
+        This host-only backend uses HiCache as the full-KV source of truth, but
+        the request's GPU KV slots are still tracked by SGLang request memory
+        accounting. Keep the slots here and let the RetroInfer-aware
+        release_kv_cache path release the whole request once it finishes.
         """
         self._require_host_only_supported()
 
@@ -96,7 +100,6 @@ class RetroInferExecutionEngine:
         seq_lens = [int(x) for x in forward_batch.seq_lens.tolist()]
 
         offset = 0
-        staged_indices = []
         for req_pool_idx, seq_len, extend_len in zip(
             req_pool_indices, seq_lens, extend_seq_lens
         ):
@@ -113,10 +116,6 @@ class RetroInferExecutionEngine:
             )
             self.cpu_store.attach_request_host_state(req_pool_idx, host_state)
             self.cpu_store.mark_last_kv_source(req_pool_idx, "host")
-            staged_indices.append(device_indices)
-
-        if staged_indices:
-            self.gpu_runtime.evict_device_indices(torch.cat(staged_indices).unique())
 
     def migrate_decode_batch_to_host(self, forward_batch) -> None:
         """Move a decoded token KV to host and release transient GPU slots."""
@@ -124,7 +123,6 @@ class RetroInferExecutionEngine:
 
         req_pool_indices = [int(x) for x in forward_batch.req_pool_indices.tolist()]
         seq_lens = [int(x) for x in forward_batch.seq_lens.tolist()]
-        staged_indices = []
         for batch_idx, (req_pool_idx, seq_len) in enumerate(
             zip(req_pool_indices, seq_lens)
         ):
@@ -136,10 +134,6 @@ class RetroInferExecutionEngine:
             )
             self.cpu_store.attach_request_host_state(req_pool_idx, host_state)
             self.cpu_store.mark_last_kv_source(req_pool_idx, "host")
-            staged_indices.append(device_indices)
-
-        if staged_indices:
-            self.gpu_runtime.evict_device_indices(torch.cat(staged_indices).unique())
 
     def drop_session(self, session) -> None:
         self.wave_buffer.drop_session(session.key)

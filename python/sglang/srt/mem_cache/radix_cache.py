@@ -474,7 +474,16 @@ class RadixCache(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
-        if req.last_node is None:
+        old_last_node = req.last_node
+        if old_last_node is None and chunked:
+            token_ids = req.fill_ids
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(token_ids)
+            ]
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            req.cache_protected_len = 0
+            return
+        elif old_last_node is None:
             return
 
         if self.disable:
@@ -522,7 +531,7 @@ class RadixCache(BasePrefixCache):
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
         req.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(req.last_node)
+        self.dec_lock_ref(old_last_node)
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
