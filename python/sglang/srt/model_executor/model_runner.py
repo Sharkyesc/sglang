@@ -2102,6 +2102,33 @@ class ModelRunner:
         ) = (self.prefill_attention_backend_str, self.decode_attention_backend_str)
         return attn_backend
 
+    def bind_kv_store_host_pool(
+        self,
+        host_pool,
+        io_backend: Optional[str] = None,
+        tree_cache=None,
+    ):
+        seen = set()
+
+        def _bind_backend(backend):
+            if backend is None:
+                return
+            backend_id = id(backend)
+            if backend_id in seen:
+                return
+            seen.add(backend_id)
+            if hasattr(backend, "bind_kv_store_host_pool"):
+                backend.bind_kv_store_host_pool(
+                    host_pool,
+                    io_backend=io_backend,
+                    tree_cache=tree_cache,
+                )
+
+        _bind_backend(getattr(self, "attn_backend", None))
+        _bind_backend(getattr(self, "decode_attn_backend", None))
+        for backend in getattr(self, "decode_attn_backend_group", []):
+            _bind_backend(backend)
+
     def _get_attention_backend_from_str(
         self, backend_str: str, init_new_workspace: bool = False
     ):

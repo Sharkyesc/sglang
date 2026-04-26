@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import os
+
 from sglang.srt.layers.attention.retroinfer.types import RetroInferDecision
 
 
 class RetroInferCapabilityChecker:
     def __init__(self, model_runner):
         self.model_runner = model_runner
+        self.min_decode_seq_len = int(
+            os.getenv("SGLANG_RETROINFER_MIN_SEQ_LEN", "4096")
+        )
 
     def check_extend(self, layer, forward_batch) -> RetroInferDecision:
         if not forward_batch.forward_mode.is_extend():
@@ -42,7 +47,11 @@ class RetroInferCapabilityChecker:
         max_len = int(seq_lens.max().item())
         if min_len != max_len:
             return RetroInferDecision(False, "fallback", "non-uniform decode seq_lens")
-        if min_len <= 1:
-            return RetroInferDecision(False, "fallback", "sequence too short")
+        if min_len < max(2, self.min_decode_seq_len):
+            return RetroInferDecision(
+                False,
+                "fallback",
+                f"sequence too short ({min_len} < {self.min_decode_seq_len})",
+            )
 
         return RetroInferDecision(True, "decode_sparse")

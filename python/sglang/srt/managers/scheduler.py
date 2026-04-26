@@ -756,6 +756,11 @@ class Scheduler(
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
                 self.tree_cache = HiRadixCache(params=params, server_args=server_args)
+                self.tp_worker.model_runner.bind_kv_store_host_pool(
+                    self.tree_cache.token_to_kv_pool_host,
+                    io_backend=server_args.hicache_io_backend,
+                    tree_cache=self.tree_cache,
+                )
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )

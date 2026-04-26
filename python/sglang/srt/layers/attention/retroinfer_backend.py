@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.retroinfer import (
     RetroInferCpuStore,
     RetroInferExecutionEngine,
     RetroInferGpuRuntime,
+    RetroInferHiCacheKVStore,
     RetroInferSessionManager,
     SGLangRetroInferKVSource,
 )
@@ -47,23 +48,50 @@ class RetroInferAttnBackend(AttentionBackend):
         self.fallback = TritonAttnBackend(model_runner)
 
         self.capability_checker = RetroInferCapabilityChecker(model_runner)
-        self.session_manager = RetroInferSessionManager()
-        self.cpu_store = RetroInferCpuStore()
+        self.kv_store = RetroInferHiCacheKVStore(model_runner)
+        self.cpu_store = RetroInferCpuStore(kv_store=self.kv_store)
         self.gpu_runtime = RetroInferGpuRuntime()
-        self.kv_source = SGLangRetroInferKVSource(model_runner)
-        self.batch_planner = RetroInferBatchPlanner(
-            self.capability_checker,
-            self.session_manager,
+        self.gpu_runtime.bind_cache_manager(
+            token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+            req_to_token_pool=model_runner.req_to_token_pool,
         )
+        self.kv_source = SGLangRetroInferKVSource(model_runner)
         self.execution_engine = RetroInferExecutionEngine(
             model_runner,
             self.kv_source,
             self.cpu_store,
             self.gpu_runtime,
         )
+        self.session_manager = RetroInferSessionManager(
+            on_drop_session=self.execution_engine.drop_session,
+            on_drop_request=self.cpu_store.drop_request,
+        )
+        self.batch_planner = RetroInferBatchPlanner(
+            self.capability_checker,
+            self.session_manager,
+        )
 
     def init_forward_metadata(self, forward_batch):
         return self.fallback.init_forward_metadata(forward_batch)
+
+    def bind_kv_store_host_pool(
+        self,
+        host_pool,
+        io_backend: Optional[str] = None,
+        tree_cache=None,
+    ):
+        self.kv_store.bind_host_pool(host_pool, io_backend=io_backend)
+        self.gpu_runtime.bind_cache_manager(
+            tree_cache=tree_cache,
+            host_pool=host_pool,
+            io_backend=io_backend,
+            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+        )
+        logger.info(
+            "RetroInfer: bound host KV pool for CPU-resident indexing and staging (io_backend=%s).",
+            self.kv_store.io_backend,
+        )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         return self.fallback.init_cuda_graph_state(max_bs, max_num_tokens)

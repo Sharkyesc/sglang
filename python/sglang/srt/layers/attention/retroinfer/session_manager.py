@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from sglang.srt.layers.attention.retroinfer.types import (
     RetroInferRequestState,
     RetroInferSession,
@@ -7,10 +9,16 @@ from sglang.srt.layers.attention.retroinfer.types import (
 
 
 class RetroInferSessionManager:
-    def __init__(self):
+    def __init__(
+        self,
+        on_drop_session: Callable[[RetroInferSession], None] | None = None,
+        on_drop_request: Callable[[int], None] | None = None,
+    ):
         self.request_states: dict[int, RetroInferRequestState] = {}
         self.sessions: dict[tuple[int, ...], RetroInferSession] = {}
         self.step = 0
+        self.on_drop_session = on_drop_session
+        self.on_drop_request = on_drop_request
 
     def _get_request_state(self, req_pool_idx: int) -> RetroInferRequestState:
         state = self.request_states.get(req_pool_idx)
@@ -65,24 +73,39 @@ class RetroInferSessionManager:
         for state in session.request_states.values():
             state.last_seq_len = new_seq_len
             state.last_access_step = self.step
-            state.cpu_index_ready = True
-            state.gpu_meta_ready = True
+            state.cache_synced_upto = max(state.cache_synced_upto, new_seq_len)
+            state.buffer_prepared_upto = max(state.buffer_prepared_upto, new_seq_len)
+            state.needs_rebuild = False
         session.prepared_seq_len = new_seq_len
+        session.cache_synced_upto = max(session.cache_synced_upto, new_seq_len)
+        session.buffer_prepared_upto = max(session.buffer_prepared_upto, new_seq_len)
         session.decode_steps += 1
 
-    def invalidate_requests(self, req_pool_indices: set[int]) -> None:
+    def _drop_session(self, key: tuple[int, ...]) -> None:
+        session = self.sessions.pop(key, None)
+        if session is None:
+            return
+        if self.on_drop_session is not None:
+            self.on_drop_session(session)
+
+    def invalidate_requests(
+        self,
+        req_pool_indices: set[int],
+        *,
+        drop_request_state: bool = False,
+    ) -> None:
         drop_keys = []
         for key, session in self.sessions.items():
             if any(req_pool_idx in session.request_states for req_pool_idx in req_pool_indices):
                 drop_keys.append(key)
         for key in drop_keys:
-            self.sessions.pop(key, None)
+            self._drop_session(key)
         for req_pool_idx in req_pool_indices:
             state = self.request_states.get(req_pool_idx)
             if state is not None:
-                state.cpu_index_ready = False
-                state.gpu_meta_ready = False
-                state.needs_rebuild = True
+                state.reset_progress()
+            if drop_request_state and self.on_drop_request is not None:
+                self.on_drop_request(req_pool_idx)
 
     def _invalidate_overlapping_sessions(self, active_key: tuple[int, ...]) -> None:
         active = set(active_key)
@@ -93,12 +116,12 @@ class RetroInferSessionManager:
             if active.intersection(key):
                 drop_keys.append(key)
         for key in drop_keys:
-            self.sessions.pop(key, None)
+            self._drop_session(key)
 
     def drop_missing_requests(self, active_req_pool_indices: list[int]) -> None:
         active = set(active_req_pool_indices)
         to_drop = [req_pool_idx for req_pool_idx in self.request_states if req_pool_idx not in active]
         if to_drop:
-            self.invalidate_requests(set(to_drop))
+            self.invalidate_requests(set(to_drop), drop_request_state=True)
             for req_pool_idx in to_drop:
                 self.request_states.pop(req_pool_idx, None)

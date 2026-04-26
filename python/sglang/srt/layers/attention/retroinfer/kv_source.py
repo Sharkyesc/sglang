@@ -21,6 +21,15 @@ class SGLangRetroInferKVSource:
     def get_req_kv_indices(self, req_pool_idx: int, upto_len: int) -> torch.Tensor:
         return self.req_to_token[req_pool_idx, :upto_len].long()
 
+    def get_req_kv_indices_by_positions(
+        self,
+        req_pool_idx: int,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        if positions.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=self.req_to_token.device)
+        return self.req_to_token[req_pool_idx, positions.to(torch.long)].long()
+
     def gather_batch_layer_tensors(
         self,
         forward_batch,
