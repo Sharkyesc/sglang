@@ -472,6 +472,9 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+        if last_node is None:
+            yield None
+            return
         if self.is_hybrid_swa:
             try:
                 swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
@@ -616,7 +619,9 @@ class PrefillAdder:
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
-                if self.is_hybrid_swa:
+                if req.last_node is None:
+                    pass
+                elif self.is_hybrid_swa:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
@@ -652,7 +657,9 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
-                if self.is_hybrid_swa:
+                if req.last_node is None:
+                    pass
+                elif self.is_hybrid_swa:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:

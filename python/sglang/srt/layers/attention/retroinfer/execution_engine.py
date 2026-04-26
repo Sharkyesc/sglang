@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import sys
@@ -51,7 +52,6 @@ class RetroInferExecutionEngine:
         self.prefill_bsz = int(os.getenv("SGLANG_RETROINFER_PREFILL_BSZ", "4"))
         self.max_new_length_hint = int(os.getenv("SGLANG_RETROINFER_MAX_NEW_LENGTH", "4096"))
         self.debug = os.getenv("SGLANG_RETROINFER_DEBUG", "").lower() in ("1", "true", "yes")
-
         self._retro_available = False
         self._warned_unavailable = False
         self._retro_import_logged = False
@@ -62,12 +62,93 @@ class RetroInferExecutionEngine:
         self._retroinfer_kernels = None
         self._retroinfer_kernels_import_tried = False
         self._retroinfer_kernels_warned_unavailable = False
-        self._partial_refresh_summary_seen: set[tuple[tuple[int, ...], int, int, int, int]] = set()
+        self._partial_refresh_summary_seen: set[
+            tuple[tuple[int, ...], int, int, int, int]
+        ] = set()
+
+    def _require_host_only_supported(self) -> None:
+        page_size = int(getattr(self.model_runner, "page_size", 1))
+        if page_size != 1:
+            raise RuntimeError(
+                "RetroInfer CPU-resident full KV mode currently supports page_size=1 only."
+            )
+        if not self.cpu_store.kv_store.is_bound():
+            raise RuntimeError(
+                "RetroInfer CPU-resident full KV mode requires --enable-hierarchical-cache "
+                "so RetroInfer can bind a host KV pool."
+            )
+
+    def migrate_extend_batch_to_host(self, forward_batch) -> None:
+        """Move just-computed extend KV to host and release its GPU slots.
+
+        Called after the final layer has written the extend chunk into the normal
+        SGLang KV pool. The request's full KV source of truth then becomes the
+        host pool, while the GPU slots can be reused as transient staging space.
+        """
+        self._require_host_only_supported()
+
+        extend_seq_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_seq_lens is None:
+            extend_seq_lens = [
+                int(x) for x in forward_batch.extend_seq_lens.cpu().tolist()
+            ]
+        req_pool_indices = [int(x) for x in forward_batch.req_pool_indices.tolist()]
+        seq_lens = [int(x) for x in forward_batch.seq_lens.tolist()]
+
+        offset = 0
+        staged_indices = []
+        for req_pool_idx, seq_len, extend_len in zip(
+            req_pool_indices, seq_lens, extend_seq_lens
+        ):
+            extend_len = int(extend_len)
+            start_pos = int(seq_len) - extend_len
+            device_indices = forward_batch.out_cache_loc[offset : offset + extend_len]
+            offset += extend_len
+            if extend_len <= 0:
+                continue
+            host_state = self.cpu_store.kv_store.append_request_chunk_from_device(
+                req_pool_idx=req_pool_idx,
+                start_pos=start_pos,
+                device_indices=device_indices,
+            )
+            self.cpu_store.attach_request_host_state(req_pool_idx, host_state)
+            self.cpu_store.mark_last_kv_source(req_pool_idx, "host")
+            staged_indices.append(device_indices)
+
+        if staged_indices:
+            self.gpu_runtime.evict_device_indices(torch.cat(staged_indices).unique())
+
+    def migrate_decode_batch_to_host(self, forward_batch) -> None:
+        """Move a decoded token KV to host and release transient GPU slots."""
+        self._require_host_only_supported()
+
+        req_pool_indices = [int(x) for x in forward_batch.req_pool_indices.tolist()]
+        seq_lens = [int(x) for x in forward_batch.seq_lens.tolist()]
+        staged_indices = []
+        for batch_idx, (req_pool_idx, seq_len) in enumerate(
+            zip(req_pool_indices, seq_lens)
+        ):
+            device_indices = forward_batch.out_cache_loc[batch_idx : batch_idx + 1]
+            host_state = self.cpu_store.kv_store.append_request_chunk_from_device(
+                req_pool_idx=req_pool_idx,
+                start_pos=int(seq_len) - 1,
+                device_indices=device_indices,
+            )
+            self.cpu_store.attach_request_host_state(req_pool_idx, host_state)
+            self.cpu_store.mark_last_kv_source(req_pool_idx, "host")
+            staged_indices.append(device_indices)
+
+        if staged_indices:
+            self.gpu_runtime.evict_device_indices(torch.cat(staged_indices).unique())
 
     def drop_session(self, session) -> None:
         self.wave_buffer.drop_session(session.key)
         if self.gpu_runtime.active_session_key == session.key:
             self.gpu_runtime.clear()
+        self._release_session_cache(session, empty_cuda_cache=True)
+        session.reset_runtime()
+
+    def _release_session_cache(self, session, *, empty_cuda_cache: bool = False) -> None:
         cache = getattr(session, "retro_cache", None)
         if cache is not None:
             for method_name in ("clear", "close", "release"):
@@ -78,7 +159,10 @@ class RetroInferExecutionEngine:
                     except Exception:
                         pass
                     break
-        session.reset_runtime()
+        session.retro_cache = None
+        if empty_cuda_cache and torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def ensure_import(self) -> bool:
         if self._retro_available:
@@ -195,7 +279,7 @@ class RetroInferExecutionEngine:
         upper_by_prefill = max(2, int(max_length) - max_prefill)
         return max(min(int(self.max_new_length_hint), upper_by_prefill), steady_min)
 
-    def build_cache(self, batch_size: int):
+    def build_cache(self, batch_size: int, dense_prefill_len: int | None = None):
         if not self.ensure_import():
             return None
 
@@ -215,8 +299,24 @@ class RetroInferExecutionEngine:
         num_kv_heads = self.model_runner.model_config.get_num_kv_heads(1)
         num_heads = self.model_runner.model_config.num_attention_heads
         head_dim = self.model_runner.model_config.head_dim
-        max_length = self._retro_effective_max_length()
-        max_new_length = self._retro_max_new_length(max_length)
+        if dense_prefill_len is None:
+            max_length = self._retro_effective_max_length()
+            max_new_length = self._retro_max_new_length(max_length)
+            static_pattern_start = self.static_pattern_start
+            static_pattern_end = self.static_pattern_end
+        else:
+            dense_prefill_len = max(1, int(dense_prefill_len))
+            context_len = int(self.model_runner.model_config.context_len)
+            max_new_length = max(
+                2,
+                min(
+                    int(self.max_new_length_hint),
+                    max(2, context_len - dense_prefill_len),
+                ),
+            )
+            max_length = dense_prefill_len + max_new_length
+            static_pattern_start = dense_prefill_len
+            static_pattern_end = 0
 
         device_str = str(self.model_runner.device)
         if device_str == "cuda":
@@ -237,8 +337,8 @@ class RetroInferExecutionEngine:
             dtype=self.model_runner.dtype,
             layer_mapping=layer_mapping,
             max_new_length=max_new_length,
-            static_pattern_start=self.static_pattern_start,
-            static_pattern_end=self.static_pattern_end,
+            static_pattern_start=static_pattern_start,
+            static_pattern_end=static_pattern_end,
             core=self.cpu_core_num,
             n_centroids=self.n_centroids,
             n_segment=self.n_segment,
@@ -258,6 +358,13 @@ class RetroInferExecutionEngine:
         static_total = int(cache.static_pattern_total)
         n_segment = int(getattr(cache, "n_segment", 1))
         return valid_start + static_total + max(1, n_segment)
+
+    def _min_seq_len_for_index_from_config(self) -> int:
+        return (
+            self.static_pattern_start
+            + self.static_pattern_end
+            + max(1, int(self.n_segment))
+        )
 
     def _working_set_target_len(self, kv_len: int) -> int:
         page_size = max(1, int(getattr(self.model_runner, "page_size", 1)))
@@ -1520,6 +1627,20 @@ class RetroInferExecutionEngine:
             layout[layer_id] = per_req
         return layout
 
+    def _build_dense_working_set_layout(
+        self,
+        session,
+        kv_len: int,
+    ) -> dict[int, dict[int, torch.Tensor]]:
+        positions = torch.arange(kv_len, dtype=torch.long)
+        layout: dict[int, dict[int, torch.Tensor]] = {}
+        n_layers = self.model_runner.model_config.num_hidden_layers
+        for layer_id in range(n_layers):
+            layout[layer_id] = {
+                req_pool_idx: positions for req_pool_idx in session.key
+            }
+        return layout
+
     def _materialized_target_len_from_layout(
         self,
         layout: dict[int, dict[int, torch.Tensor]],
@@ -1538,6 +1659,7 @@ class RetroInferExecutionEngine:
         kv_len: int,
         layout: dict[int, dict[int, torch.Tensor]],
         target_len: int,
+        dense_layout: bool = False,
     ) -> bool:
         q_heads = layer.tp_q_head_num
         q_dim = layer.qk_head_dim
@@ -1549,24 +1671,28 @@ class RetroInferExecutionEngine:
 
         target_len = max(1, self._materialized_target_len_from_layout(layout))
         slack_len = self._working_set_slack_len(target_len)
-        first_req_idx = int(session.key[0]) if session.key else -1
-        first_layer_index = (
-            self.cpu_store.get_layer_index(first_req_idx, layer.layer_id)
-            if first_req_idx >= 0
-            else None
-        )
-        base_positions, _ = self._base_working_set_positions(
-            kv_len,
-            target_len,
-            layer_index=first_layer_index,
-        )
+        if dense_layout:
+            base_len = target_len
+        else:
+            first_req_idx = int(session.key[0]) if session.key else -1
+            first_layer_index = (
+                self.cpu_store.get_layer_index(first_req_idx, layer.layer_id)
+                if first_req_idx >= 0
+                else None
+            )
+            base_positions, _ = self._base_working_set_positions(
+                kv_len,
+                target_len,
+                layer_index=first_layer_index,
+            )
+            base_len = int(base_positions.numel())
         self.wave_buffer.bind_prepared_layout(
             session_key=session.key,
             layer_positions=layout,
             target_len=target_len,
             slack_len=slack_len,
             page_size=max(1, int(getattr(self.model_runner, "page_size", 1))),
-            base_len=int(base_positions.numel()),
+            base_len=base_len,
         )
 
         used_host_path = False
@@ -1599,8 +1725,8 @@ class RetroInferExecutionEngine:
             )
             cache.prefill_update_kv_cache(q_dummy, keys, values, layer_id, start_bdx=0)
             cache.sync(layer_id, start_bdx=0)
-            if self._admit_pending_scatter_blocks(session.key, layer, layer_id):
-                self.wave_buffer.mark_scatter_complete(session.key, layer_id)
+            # Full GPU KV is intentionally not maintained in RetroInfer's
+            # host-first mode, so retrieval scatter-back is disabled.
 
         cache.prepare_cache()
         session.retro_cache = cache
@@ -2079,20 +2205,31 @@ class RetroInferExecutionEngine:
     ) -> bool:
         kv_len = int(torch.min(forward_batch.seq_lens).item())
         target_len = self._working_set_target_len(kv_len)
+        short_dense_only = kv_len < self._min_seq_len_for_index_from_config()
+        if short_dense_only:
+            layout = self._build_dense_working_set_layout(session, kv_len)
+            target_len = kv_len
+        else:
+            layout = None
         query_map = self._query_by_request_for_current_layer(
             session=session,
             req_pool_indices=[int(req) for req in forward_batch.req_pool_indices.tolist()],
             layer_id=layer_id,
             q=q,
         )
-        layout = self._build_working_set_layout(
-            session,
-            layer,
-            kv_len,
-            target_len,
-            query_map=query_map,
-        )
-        cache = self.build_cache(session.batch_size)
+        if layout is None:
+            layout = self._build_working_set_layout(
+                session,
+                layer,
+                kv_len,
+                target_len,
+                query_map=query_map,
+            )
+        self.wave_buffer.drop_session(session.key)
+        if self.gpu_runtime.active_session_key == session.key:
+            self.gpu_runtime.clear()
+        self._release_session_cache(session, empty_cuda_cache=True)
+        cache = self.build_cache(session.batch_size, dense_prefill_len=target_len)
         if cache is None:
             return False
         try:
@@ -2103,10 +2240,11 @@ class RetroInferExecutionEngine:
                 kv_len=kv_len,
                 layout=layout,
                 target_len=target_len,
+                dense_layout=short_dense_only,
             )
             return True
         except Exception as exc:
-            logger.warning(
+            logger.exception(
                 "RetroInfer working-set refresh failed (%s: %s)",
                 type(exc).__name__,
                 exc,
@@ -2117,13 +2255,10 @@ class RetroInferExecutionEngine:
         if session.prepared and session.retro_cache is not None:
             return True
 
-        cache = session.retro_cache or self.build_cache(session.batch_size)
-        if cache is None:
-            return False
-
         kv_len = int(torch.min(forward_batch.seq_lens).item()) - 1
-        if kv_len <= 0 or kv_len < self._min_seq_len_for_index(cache):
+        if kv_len <= 0:
             return False
+        short_dense_only = kv_len < self._min_seq_len_for_index_from_config()
 
         min_host_staged_upto = kv_len
         min_index_built_upto = kv_len
@@ -2134,26 +2269,34 @@ class RetroInferExecutionEngine:
         for req_pool_idx in session.key:
             self.cpu_store.ensure_host_resident(req_pool_idx, kv_len)
             req_state = session.request_states.get(req_pool_idx)
-            if not self.cpu_store.is_request_ready(req_pool_idx, kv_len):
+            if (
+                not short_dense_only
+                and not self.cpu_store.is_request_ready(req_pool_idx, kv_len)
+            ):
                 self.index_builder.build_request(req_pool_idx, kv_len + 1)
 
             readiness = self.cpu_store.get_request_readiness(req_pool_idx, kv_len)
             host_stored_upto = int(readiness["host_stored_upto"])
             indexed_upto = int(readiness["indexed_upto"])
             min_host_staged_upto = min(min_host_staged_upto, host_stored_upto)
-            min_index_built_upto = min(min_index_built_upto, indexed_upto)
+            if not short_dense_only:
+                min_index_built_upto = min(min_index_built_upto, indexed_upto)
 
             if not bool(readiness["host_ready"]):
                 host_not_ready.append(int(req_pool_idx))
-            if not bool(readiness["index_ready"]):
+            if not short_dense_only and not bool(readiness["index_ready"]):
                 index_not_ready.append(int(req_pool_idx))
             if bool(readiness["gpu_fallback"]):
                 gpu_fallback_reqs.append(int(req_pool_idx))
 
             if req_state is not None:
                 req_state.host_staged_upto = max(req_state.host_staged_upto, host_stored_upto)
-                req_state.indexed_upto = max(req_state.indexed_upto, indexed_upto)
-                req_state.needs_rebuild = indexed_upto < kv_len
+                if short_dense_only:
+                    req_state.indexed_upto = max(req_state.indexed_upto, kv_len)
+                    req_state.needs_rebuild = False
+                else:
+                    req_state.indexed_upto = max(req_state.indexed_upto, indexed_upto)
+                    req_state.needs_rebuild = indexed_upto < kv_len
 
         session.host_staged_upto = max(session.host_staged_upto, min_host_staged_upto)
         session.index_built_upto = max(session.index_built_upto, min_index_built_upto)
@@ -2178,13 +2321,20 @@ class RetroInferExecutionEngine:
                 gpu_fallback_reqs,
             )
 
-        working_set_len = self._working_set_target_len(kv_len)
-        layout = self._build_working_set_layout(
-            session,
-            layer,
-            kv_len,
-            working_set_len,
-        )
+        if short_dense_only:
+            working_set_len = kv_len
+            layout = self._build_dense_working_set_layout(session, kv_len)
+        else:
+            working_set_len = self._working_set_target_len(kv_len)
+            layout = self._build_working_set_layout(
+                session,
+                layer,
+                kv_len,
+                working_set_len,
+            )
+        cache = self.build_cache(session.batch_size, dense_prefill_len=working_set_len)
+        if cache is None:
+            return False
         
 
         torch.cuda.synchronize()
@@ -2196,10 +2346,11 @@ class RetroInferExecutionEngine:
                 kv_len=kv_len,
                 layout=layout,
                 target_len=working_set_len,
+                dense_layout=short_dense_only,
             )
         except Exception as exc:
-            logger.warning(
-                "RetroInfer fallback to Triton: build from SGLang KV failed (%s: %s)",
+            logger.exception(
+                "RetroInfer build from host KV failed (%s: %s)",
                 type(exc).__name__,
                 exc,
             )
@@ -2238,6 +2389,7 @@ class RetroInferExecutionEngine:
         )
 
         if rebuild_required:
+            cache = None
             refreshed = self._refresh_session_working_set_after_decode(
                 session=session,
                 forward_batch=forward_batch,
@@ -2246,7 +2398,9 @@ class RetroInferExecutionEngine:
                 q=qv,
             )
             if not refreshed:
-                cache.decode_update_kv_cache(kv, vv, layer_id)
+                raise RuntimeError(
+                    "RetroInfer failed to refresh the CPU-resident working set."
+                )
             else:
                 cache = session.retro_cache
                 assert cache is not None, "working-set refresh must leave a valid RetroInfer cache"
@@ -2329,6 +2483,6 @@ class RetroInferExecutionEngine:
             output = output.unsqueeze(1)
         else:
             output = working_output
-        if self._admit_pending_scatter_blocks(session.key, layer, layer_id):
-            self.wave_buffer.mark_scatter_complete(session.key, layer_id)
+        # Full GPU KV is intentionally not maintained in RetroInfer's host-first
+        # mode, so retrieval scatter-back is disabled.
         return output.view(forward_batch.batch_size, -1)

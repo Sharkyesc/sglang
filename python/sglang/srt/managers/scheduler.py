@@ -1466,9 +1466,23 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
+    def _prefix_match_tree_cache(self):
+        # RetroInfer owns full KV in HostKVCache by request/session, not in the
+        # radix tree's GPU KV indices. Reusing radix prefixes would give a fresh
+        # req_pool_idx a nonzero prefix without corresponding host KV.
+        if (
+            self.server_args.attention_backend == "retroinfer"
+            or self.server_args.prefill_attention_backend == "retroinfer"
+        ):
+            return None
+        return self.tree_cache
+
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache)
+            tree_cache = self._prefix_match_tree_cache()
+            req.init_next_round_input(tree_cache)
+            if tree_cache is None:
+                return
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity
@@ -1813,7 +1827,7 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(self._prefix_match_tree_cache())
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

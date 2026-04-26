@@ -474,6 +474,9 @@ class RadixCache(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
+        if req.last_node is None:
+            return
+
         if self.disable:
             return
 

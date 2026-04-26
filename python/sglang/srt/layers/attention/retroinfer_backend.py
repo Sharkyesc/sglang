@@ -27,13 +27,15 @@ logging.basicConfig(
 
 class RetroInferAttnBackend(AttentionBackend):
     """
-    RetroInfer integration built on top of SGLang's own KV lifecycle.
+    RetroInfer integration with CPU-resident full KV ownership.
 
     Design goals for this backend:
-    - SGLang's req_to_token/token_to_kv_pool remain the source of truth.
-    - Extend/prefill stays on the fallback backend and only updates RetroInfer state.
+    - HostKVCache is the source of truth for full request KV.
+    - SGLang's device KV slots are transient staging space for prefill/decode chunks.
+    - Extend/prefill computes through the dense fallback backend, then migrates KV to host.
     - Decode enters RetroInfer only after a session is explicitly planned and prepared
-      from SGLang KV.
+      from host KV into a GPU working set.
+    - Dense decode fallback is disabled because full KV is not resident on GPU.
     - Session/request state is managed outside the backend entrypoints, which keeps the
       backend thin and avoids hidden batch-size keyed state reuse.
     """
@@ -163,6 +165,8 @@ class RetroInferAttnBackend(AttentionBackend):
         plan = self.batch_planner.plan_extend(layer, forward_batch)
         if plan.mode == "fallback" and layer.layer_id == 0 and plan.reason:
             logger.debug("RetroInfer extend observe skipped: %s", plan.reason)
+        if layer.layer_id == self.model_runner.model_config.num_hidden_layers - 1:
+            self.execution_engine.migrate_extend_batch_to_host(forward_batch)
         return out
 
     def forward_decode(
@@ -177,10 +181,9 @@ class RetroInferAttnBackend(AttentionBackend):
     ):
         plan = self.batch_planner.plan_decode(layer, forward_batch)
         if plan.mode == "fallback" or plan.session is None:
-            if plan.reason and layer.layer_id == 0:
-                logger.debug("RetroInfer decode fallback: %s", plan.reason)
-            return self.fallback.forward_decode(
-                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, sinks=sinks
+            raise RuntimeError(
+                "RetroInfer cannot fallback to dense decode because full KV is "
+                f"CPU-resident: {plan.reason}"
             )
 
         session = plan.session
@@ -191,14 +194,8 @@ class RetroInferAttnBackend(AttentionBackend):
                 layer,
             )
             if not prepared:
-                return self.fallback.forward_decode(
-                    q,
-                    k,
-                    v,
-                    layer,
-                    forward_batch,
-                    save_kv_cache=save_kv_cache,
-                    sinks=sinks,
+                raise RuntimeError(
+                    "RetroInfer failed to prepare a sparse decode session from host KV."
                 )
             output = self.execution_engine.run_decode(
                 session,
@@ -210,14 +207,11 @@ class RetroInferAttnBackend(AttentionBackend):
                 save_kv_cache=save_kv_cache,
             )
             if layer.layer_id == self.model_runner.model_config.num_hidden_layers - 1:
+                self.execution_engine.migrate_decode_batch_to_host(forward_batch)
                 self.session_manager.mark_decode_advanced(session, plan.seq_len + 1)
             return output
         except Exception as exc:
-            logger.warning(
-                "RetroInfer fallback to Triton: decode execution failed (%s: %s)",
-                type(exc).__name__,
-                exc,
+            logger.exception(
+                "RetroInfer decode failed; dense fallback is disabled because full KV is CPU-resident."
             )
-            return self.fallback.forward_decode(
-                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, sinks=sinks
-            )
+            raise

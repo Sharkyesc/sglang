@@ -9,7 +9,7 @@ class RetroInferCapabilityChecker:
     def __init__(self, model_runner):
         self.model_runner = model_runner
         self.min_decode_seq_len = int(
-            os.getenv("SGLANG_RETROINFER_MIN_SEQ_LEN", "4096")
+            os.getenv("SGLANG_RETROINFER_MIN_SEQ_LEN", "2")
         )
 
     def check_extend(self, layer, forward_batch) -> RetroInferDecision:

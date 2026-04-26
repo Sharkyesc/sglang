@@ -72,9 +72,16 @@ class RetroInferGpuRuntime:
         if host_indices is None:
             return None
 
+        host_indices_for_transfer = host_indices
+        if host_indices_for_transfer.device != device_indices.device:
+            host_indices_for_transfer = host_indices_for_transfer.to(
+                device=device_indices.device,
+                dtype=torch.int64,
+                non_blocking=True,
+            ).contiguous()
         self.host_pool.backup_from_device_all_layer(
             self.device_pool,
-            host_indices=host_indices,
+            host_indices=host_indices_for_transfer,
             device_indices=device_indices,
             io_backend=self.io_backend or "kernel",
         )

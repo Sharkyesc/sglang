@@ -464,6 +464,12 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    if req.last_node is None:
+        req.pop_committed_kv_cache()
+        req.pop_overallocated_kv_cache()
+        tree_cache.req_to_token_pool.free(req.req_pool_idx)
+        return
+
     tree_cache.cache_finished_req(req, is_insert=is_insert)
     start_p, end_p = req.pop_overallocated_kv_cache()
 

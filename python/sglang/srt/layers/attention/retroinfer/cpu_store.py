@@ -101,8 +101,17 @@ class RetroInferCpuStore:
     ) -> None:
         request_state = self.get_request_state(req_pool_idx)
         if request_state is None:
-            return
-        request_state.host_kv = host_state
+            request_state = RetroInferRequestCpuState(
+                req_pool_idx=req_pool_idx,
+                seq_len=host_state.stored_upto,
+                indexed_upto=0,
+                dense_only=True,
+                host_kv=host_state,
+            )
+            self.request_states[req_pool_idx] = request_state
+        else:
+            request_state.host_kv = host_state
+            request_state.seq_len = max(request_state.seq_len, host_state.stored_upto)
         entry = self.request_meta.setdefault(req_pool_idx, {})
         entry["host_stored_upto"] = host_state.stored_upto
         entry["host_kv_resident"] = host_state.resident

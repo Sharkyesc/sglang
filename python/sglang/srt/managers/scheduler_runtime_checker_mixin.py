@@ -32,6 +32,15 @@ class SchedulerRuntimeCheckerMixin:
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
 
+    def _is_retroinfer_host_kv(self: Scheduler) -> bool:
+        prefill_backend, decode_backend = self.server_args.get_attention_backends()
+        attention_backend = getattr(self.server_args, "attention_backend", None)
+        return (
+            prefill_backend == "retroinfer"
+            or decode_backend == "retroinfer"
+            or attention_backend == "retroinfer"
+        )
+
     def _get_mamba_token_info(self: Scheduler):
         is_radix_tree = isinstance(self.tree_cache, MambaRadixCache)
         full_available_size = self.token_to_kv_pool_allocator.available_size()
@@ -127,6 +136,13 @@ class SchedulerRuntimeCheckerMixin:
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
+        if self._is_retroinfer_host_kv():
+            memory_leak = available_size != self.max_total_num_tokens
+            token_msg = (
+                f"{self.max_total_num_tokens=}, {available_size=}, "
+                f"{evictable_size=}, {protected_size=} (RetroInfer host KV)\n"
+            )
+            return memory_leak, token_msg
         memory_leak = (available_size + evictable_size) != (
             # self.max_total_num_tokens
             # if not self.enable_hierarchical_cache

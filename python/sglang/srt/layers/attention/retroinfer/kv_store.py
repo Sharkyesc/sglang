@@ -157,6 +157,23 @@ class RetroInferHiCacheKVStore(RetroInferKVStore):
         pad_value = device_indices[-1].view(1).expand(pad_len)
         return torch.cat([device_indices, pad_value], dim=0)
 
+    def _indices_for_transfer(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return index tensors on devices expected by HiCache transfer kernels."""
+        device_indices = device_indices.to(torch.int64).contiguous()
+        if host_indices.device != device_indices.device:
+            host_indices_for_transfer = host_indices.to(
+                device=device_indices.device,
+                dtype=torch.int64,
+                non_blocking=True,
+            ).contiguous()
+        else:
+            host_indices_for_transfer = host_indices.to(torch.int64).contiguous()
+        return host_indices_for_transfer, device_indices
+
     def _build_host_state(
         self,
         req_pool_idx: int,
@@ -277,9 +294,13 @@ class RetroInferHiCacheKVStore(RetroInferKVStore):
                         f"RetroInfer host KV store is out of capacity for req_pool_idx={req_pool_idx}."
                     )
             padded_device_indices = self._pad_device_indices(device_indices, aligned_len)
+            host_indices_for_transfer, padded_device_indices = self._indices_for_transfer(
+                host_indices,
+                padded_device_indices,
+            )
             self.host_pool.backup_from_device_all_layer(
                 self.device_pool,
-                host_indices=host_indices,
+                host_indices=host_indices_for_transfer,
                 device_indices=padded_device_indices,
                 io_backend=self.io_backend,
             )
@@ -290,6 +311,102 @@ class RetroInferHiCacheKVStore(RetroInferKVStore):
             stored_upto=upto_len,
             host_indices=host_index_tuple,
             source_token_indices=source_token_indices,
+            resident=True,
+        )
+        self.request_host_states[req_pool_idx] = request_state
+        return request_state
+
+    def append_request_chunk_from_device(
+        self,
+        req_pool_idx: int,
+        start_pos: int,
+        device_indices: torch.Tensor,
+    ) -> RetroInferRequestHostKVState:
+        """Append newly materialized GPU KV slots to the host KV source of truth.
+
+        This is intentionally conservative and currently targets the host-only
+        RetroInfer MVP where page_size=1. In that mode GPU slots are only a
+        transient staging arena, while the host pool owns the full request KV.
+        """
+        if not self.is_bound():
+            raise RuntimeError("RetroInfer host KV store is not bound to a host pool.")
+        if self.page_size != 1:
+            raise RuntimeError(
+                "RetroInfer host-only incremental staging currently requires page_size=1."
+            )
+
+        device_indices = device_indices.to(torch.int64).contiguous()
+        append_len = int(device_indices.numel())
+        existing_state = self.request_host_states.get(req_pool_idx)
+        expected_start = 0 if existing_state is None else int(existing_state.stored_upto)
+        start_pos = int(start_pos)
+        if start_pos < 0:
+            raise RuntimeError(
+                "RetroInfer host-only staging received a negative start_pos "
+                f"(req_pool_idx={req_pool_idx}, start_pos={start_pos})."
+            )
+        if start_pos < expected_start:
+            overlap = expected_start - start_pos
+            if overlap >= append_len:
+                return existing_state or self._build_host_state(
+                    req_pool_idx=req_pool_idx,
+                    stored_upto=expected_start,
+                    host_indices=tuple(),
+                    source_token_indices=tuple(),
+                    resident=True,
+                )
+            device_indices = device_indices[overlap:].contiguous()
+            append_len = int(device_indices.numel())
+            start_pos = expected_start
+        if start_pos != expected_start:
+            raise RuntimeError(
+                "RetroInfer host-only staging requires contiguous chunks "
+                f"(req_pool_idx={req_pool_idx}, start_pos={start_pos}, "
+                f"expected={expected_start})."
+            )
+
+        if append_len == 0:
+            return existing_state or self._build_host_state(
+                req_pool_idx=req_pool_idx,
+                stored_upto=0,
+                host_indices=tuple(),
+                source_token_indices=tuple(),
+                resident=True,
+            )
+
+        host_indices = self.host_pool.alloc(append_len)
+        if host_indices is None:
+            raise RuntimeError(
+                f"RetroInfer host KV store is out of capacity for req_pool_idx={req_pool_idx}."
+            )
+        host_indices_for_transfer, device_indices = self._indices_for_transfer(
+            host_indices,
+            device_indices,
+        )
+        self.host_pool.backup_from_device_all_layer(
+            self.device_pool,
+            host_indices=host_indices_for_transfer,
+            device_indices=device_indices,
+            io_backend=self.io_backend,
+        )
+
+        old_host_indices = (
+            tuple() if existing_state is None else existing_state.host_indices
+        )
+        old_source_indices = (
+            tuple() if existing_state is None else existing_state.source_token_indices
+        )
+        new_host_indices = old_host_indices + tuple(
+            int(x) for x in host_indices.tolist()
+        )
+        new_source_indices = old_source_indices + tuple(
+            int(x) for x in device_indices.tolist()
+        )
+        request_state = self._build_host_state(
+            req_pool_idx=req_pool_idx,
+            stored_upto=expected_start + append_len,
+            host_indices=new_host_indices,
+            source_token_indices=new_source_indices,
             resident=True,
         )
         self.request_host_states[req_pool_idx] = request_state
