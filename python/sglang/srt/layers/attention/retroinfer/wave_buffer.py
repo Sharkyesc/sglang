@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+import threading
 
 import torch
 
@@ -44,6 +46,13 @@ class RetroInferLayerWorkingSetState:
     cache_resident_block_ids: dict[int, torch.Tensor] = field(default_factory=dict)
     cache_resident_block_cache_slots: dict[int, torch.Tensor] = field(default_factory=dict)
     cache_resident_block_page_table: dict[int, torch.Tensor] = field(default_factory=dict)
+    retrieval_cache_key_pages: torch.Tensor | None = None
+    retrieval_cache_value_pages: torch.Tensor | None = None
+    retrieval_cache_capacity_pages: int = 0
+    retrieval_cache_block_to_slot: dict[tuple[int, int], int] = field(default_factory=dict)
+    retrieval_cache_lru: dict[tuple[int, int], int] = field(default_factory=dict)
+    retrieval_cache_tick: int = 0
+    retrieval_cache_lock: threading.RLock = field(default_factory=threading.RLock)
     append_key_pages: torch.Tensor | None = None
     append_value_pages: torch.Tensor | None = None
     live_len: int = 0
@@ -68,9 +77,62 @@ class RetroInferWaveBufferManager:
 
     def __init__(self):
         self.sessions: dict[tuple[int, ...], RetroInferSessionWorkingSetState] = {}
+        self._cache_update_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="retroinfer-cache-update",
+        )
+        self._cache_update_futures: list[Future] = []
 
     def _empty_long(self) -> torch.Tensor:
         return torch.empty((0,), dtype=torch.long)
+
+    def _drain_cache_update_futures(self, *, wait: bool = False) -> None:
+        if not self._cache_update_futures:
+            return
+        remaining: list[Future] = []
+        for future in self._cache_update_futures:
+            if wait or future.done():
+                future.result()
+            else:
+                remaining.append(future)
+        self._cache_update_futures = remaining
+
+    def _submit_cache_update(self, fn, *args) -> None:
+        self._cache_update_futures.append(
+            self._cache_update_executor.submit(fn, *args)
+        )
+
+    def _apply_retrieval_metadata_update(
+        self,
+        layer_state: RetroInferLayerWorkingSetState,
+        req_pool_idx: int,
+        current_blocks: torch.Tensor,
+        current_slots: torch.Tensor,
+        current_page_table: torch.Tensor,
+        hit_tensor: torch.Tensor,
+        miss_tensor: torch.Tensor,
+        hit_slots: torch.Tensor,
+        hit_page_table: torch.Tensor,
+        miss_slots: torch.Tensor,
+        miss_page_table: torch.Tensor,
+    ) -> None:
+        req_pool_idx = int(req_pool_idx)
+        with layer_state.retrieval_cache_lock:
+            layer_state.retrieval_block_ids[req_pool_idx] = current_blocks
+            layer_state.retrieval_block_cache_slots[req_pool_idx] = current_slots
+            layer_state.retrieval_block_page_table[req_pool_idx] = current_page_table
+            layer_state.retrieval_hit_block_ids[req_pool_idx] = hit_tensor
+            layer_state.retrieval_hit_block_cache_slots[req_pool_idx] = hit_slots
+            layer_state.retrieval_hit_block_page_table[req_pool_idx] = hit_page_table
+            layer_state.retrieval_miss_block_ids[req_pool_idx] = miss_tensor
+            layer_state.retrieval_miss_block_cache_slots[req_pool_idx] = miss_slots
+            layer_state.retrieval_miss_block_page_table[req_pool_idx] = miss_page_table
+            layer_state.pending_scatter_block_ids[req_pool_idx] = miss_tensor
+            layer_state.pending_scatter_block_cache_slots[req_pool_idx] = miss_slots
+            layer_state.pending_scatter_block_page_table[req_pool_idx] = miss_page_table
+            layer_state.cache_resident_block_ids[req_pool_idx] = current_blocks
+            layer_state.cache_resident_block_cache_slots[req_pool_idx] = current_slots
+            layer_state.cache_resident_block_page_table[req_pool_idx] = current_page_table
 
     def _resize_or_init_pages(
         self,
@@ -282,6 +344,261 @@ class RetroInferWaveBufferManager:
             rounding_mode="floor",
         )
         return cache_slots, page_table
+
+    def _positions_grouped_by_block(
+        self,
+        positions: torch.Tensor,
+        page_size: int,
+    ) -> list[tuple[int, list[int]]]:
+        if positions.numel() == 0:
+            return []
+        groups: list[tuple[int, list[int]]] = []
+        current_block = None
+        current_positions: list[int] = []
+        for pos in positions.to(torch.long).tolist():
+            block_id = int(pos) // max(1, int(page_size))
+            if current_block is None:
+                current_block = block_id
+            if block_id != current_block:
+                groups.append((int(current_block), current_positions))
+                current_block = block_id
+                current_positions = []
+            current_positions.append(int(pos))
+        if current_block is not None:
+            groups.append((int(current_block), current_positions))
+        return groups
+
+    def _ensure_retrieval_cache_pages(
+        self,
+        *,
+        layer_state: RetroInferLayerWorkingSetState,
+        capacity_pages: int,
+        page_size: int,
+        kv_heads: int,
+        qk_dim: int,
+        v_dim: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> None:
+        capacity_pages = max(0, int(capacity_pages))
+        if capacity_pages <= int(layer_state.retrieval_cache_capacity_pages):
+            return
+        new_key_pages = torch.zeros(
+            (capacity_pages, page_size, kv_heads, qk_dim),
+            dtype=dtype,
+            device=device,
+        )
+        new_value_pages = torch.zeros(
+            (capacity_pages, page_size, kv_heads, v_dim),
+            dtype=dtype,
+            device=device,
+        )
+        old_capacity = int(layer_state.retrieval_cache_capacity_pages)
+        if old_capacity > 0:
+            if layer_state.retrieval_cache_key_pages is not None:
+                new_key_pages[:old_capacity].copy_(
+                    layer_state.retrieval_cache_key_pages[:old_capacity]
+                )
+            if layer_state.retrieval_cache_value_pages is not None:
+                new_value_pages[:old_capacity].copy_(
+                    layer_state.retrieval_cache_value_pages[:old_capacity]
+                )
+        layer_state.retrieval_cache_key_pages = new_key_pages
+        layer_state.retrieval_cache_value_pages = new_value_pages
+        layer_state.retrieval_cache_capacity_pages = capacity_pages
+
+    def _select_retrieval_cache_slot(
+        self,
+        layer_state: RetroInferLayerWorkingSetState,
+    ) -> int | None:
+        with layer_state.retrieval_cache_lock:
+            capacity = int(layer_state.retrieval_cache_capacity_pages)
+            if capacity <= 0:
+                return None
+            used_slots = set(
+                int(slot) for slot in layer_state.retrieval_cache_block_to_slot.values()
+            )
+            for slot in range(capacity):
+                if slot not in used_slots:
+                    return slot
+            if not layer_state.retrieval_cache_lru:
+                return 0
+            victim_key = min(
+                layer_state.retrieval_cache_lru,
+                key=lambda key: layer_state.retrieval_cache_lru[key],
+            )
+            victim_slot = int(layer_state.retrieval_cache_block_to_slot.pop(victim_key))
+            layer_state.retrieval_cache_lru.pop(victim_key, None)
+            return victim_slot
+
+    def _admit_retrieval_cache_page(
+        self,
+        *,
+        layer_state: RetroInferLayerWorkingSetState,
+        cache_key: tuple[int, int],
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> int | None:
+        if (
+            layer_state.retrieval_cache_key_pages is None
+            or layer_state.retrieval_cache_value_pages is None
+            or int(layer_state.retrieval_cache_capacity_pages) <= 0
+        ):
+            return None
+        slot = self._select_retrieval_cache_slot(layer_state)
+        if slot is None:
+            return None
+        layer_state.retrieval_cache_key_pages[slot].copy_(keys)
+        layer_state.retrieval_cache_value_pages[slot].copy_(values)
+        with layer_state.retrieval_cache_lock:
+            old_key = None
+            for key, mapped_slot in layer_state.retrieval_cache_block_to_slot.items():
+                if int(mapped_slot) == int(slot):
+                    old_key = key
+                    break
+            if old_key is not None:
+                layer_state.retrieval_cache_block_to_slot.pop(old_key, None)
+                layer_state.retrieval_cache_lru.pop(old_key, None)
+            layer_state.retrieval_cache_block_to_slot[cache_key] = int(slot)
+            layer_state.retrieval_cache_tick += 1
+            layer_state.retrieval_cache_lru[cache_key] = layer_state.retrieval_cache_tick
+        return int(slot)
+
+    def _materialize_retrieval_pages_with_cache(
+        self,
+        *,
+        layer_state: RetroInferLayerWorkingSetState,
+        req_pool_idx: int,
+        batch_idx: int,
+        retrieval_positions: torch.Tensor,
+        retrieval_key_pages: torch.Tensor,
+        retrieval_value_pages: torch.Tensor,
+        fetch_fn,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        kv_heads: int,
+        qk_dim: int,
+        v_dim: int,
+    ) -> None:
+        page_size = max(1, int(layer_state.page_size))
+        block_groups = self._positions_grouped_by_block(retrieval_positions, page_size)
+        if not block_groups:
+            return
+
+        hit_blocks: list[int] = []
+        miss_blocks: list[int] = []
+        resident_blocks: list[int] = []
+        resident_slots: list[int] = []
+
+        for page_idx, (block_id, block_positions) in enumerate(block_groups):
+            if page_idx >= retrieval_key_pages.shape[1]:
+                break
+            cache_key = (int(req_pool_idx), int(block_id))
+            with layer_state.retrieval_cache_lock:
+                cache_slot = layer_state.retrieval_cache_block_to_slot.get(cache_key)
+            hit = (
+                cache_slot is not None
+                and layer_state.retrieval_cache_key_pages is not None
+                and layer_state.retrieval_cache_value_pages is not None
+                and cache_slot < layer_state.retrieval_cache_key_pages.shape[0]
+            )
+            if hit:
+                retrieval_key_pages[batch_idx, page_idx].copy_(
+                    layer_state.retrieval_cache_key_pages[cache_slot]
+                )
+                retrieval_value_pages[batch_idx, page_idx].copy_(
+                    layer_state.retrieval_cache_value_pages[cache_slot]
+                )
+                with layer_state.retrieval_cache_lock:
+                    layer_state.retrieval_cache_tick += 1
+                    layer_state.retrieval_cache_lru[cache_key] = (
+                        layer_state.retrieval_cache_tick
+                    )
+                hit_blocks.append(int(block_id))
+            else:
+                pos_tensor = torch.tensor(block_positions, dtype=torch.long)
+                keys, values = fetch_fn(int(req_pool_idx), pos_tensor)
+                keys = keys.to(device=device, dtype=dtype, non_blocking=True)
+                values = values.to(device=device, dtype=dtype, non_blocking=True)
+                if keys.shape[0] < page_size:
+                    pad_k = torch.zeros(
+                        (page_size - keys.shape[0], kv_heads, qk_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    pad_v = torch.zeros(
+                        (page_size - values.shape[0], kv_heads, v_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    keys = torch.cat([keys, pad_k], dim=0)
+                    values = torch.cat([values, pad_v], dim=0)
+                retrieval_key_pages[batch_idx, page_idx].copy_(
+                    keys[:page_size].view(page_size, kv_heads, qk_dim)
+                )
+                retrieval_value_pages[batch_idx, page_idx].copy_(
+                    values[:page_size].view(page_size, kv_heads, v_dim)
+                )
+                cache_slot = self._admit_retrieval_cache_page(
+                    layer_state=layer_state,
+                    cache_key=cache_key,
+                    keys=retrieval_key_pages[batch_idx, page_idx],
+                    values=retrieval_value_pages[batch_idx, page_idx],
+                )
+                miss_blocks.append(int(block_id))
+            resident_blocks.append(int(block_id))
+            slot = int(cache_slot if cache_slot is not None else page_idx)
+            resident_slots.append(slot * page_size)
+
+        current_blocks = torch.tensor(resident_blocks, dtype=torch.long)
+        current_slots = torch.tensor(resident_slots, dtype=torch.long)
+        current_page_table = torch.div(
+            current_slots,
+            page_size,
+            rounding_mode="floor",
+        )
+        hit_tensor = torch.tensor(hit_blocks, dtype=torch.long)
+        miss_tensor = torch.tensor(miss_blocks, dtype=torch.long)
+
+        hit_slots, hit_page_table = self._select_block_mapping(
+            source_block_ids=current_blocks,
+            source_cache_slots=current_slots,
+            target_block_ids=hit_blocks,
+            page_size=page_size,
+        )
+        miss_slots, miss_page_table = self._select_block_mapping(
+            source_block_ids=current_blocks,
+            source_cache_slots=current_slots,
+            target_block_ids=miss_blocks,
+            page_size=page_size,
+        )
+
+        # Keep hit/miss visible for same-step logging, then let the async path
+        # publish the resident/pending cache metadata for future steps.
+        req_idx = int(req_pool_idx)
+        layer_state.retrieval_block_ids[req_idx] = current_blocks
+        layer_state.retrieval_block_cache_slots[req_idx] = current_slots
+        layer_state.retrieval_block_page_table[req_idx] = current_page_table
+        layer_state.retrieval_hit_block_ids[req_idx] = hit_tensor
+        layer_state.retrieval_hit_block_cache_slots[req_idx] = hit_slots
+        layer_state.retrieval_hit_block_page_table[req_idx] = hit_page_table
+        layer_state.retrieval_miss_block_ids[req_idx] = miss_tensor
+        layer_state.retrieval_miss_block_cache_slots[req_idx] = miss_slots
+        layer_state.retrieval_miss_block_page_table[req_idx] = miss_page_table
+        self._submit_cache_update(
+            self._apply_retrieval_metadata_update,
+            layer_state,
+            req_idx,
+            current_blocks,
+            current_slots,
+            current_page_table,
+            hit_tensor,
+            miss_tensor,
+            hit_slots,
+            hit_page_table,
+            miss_slots,
+            miss_page_table,
+        )
 
     def _update_retrieval_cache_state(
         self,
@@ -522,6 +839,7 @@ class RetroInferWaveBufferManager:
         fetch_fn,
         cache_slot_lookup_fn=None,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        self._drain_cache_update_futures(wait=False)
         session_state = self.sessions.get(session_key)
         if session_state is None:
             raise KeyError(f"RetroInfer wave buffer missing session {session_key}.")
@@ -566,6 +884,19 @@ class RetroInferWaveBufferManager:
                 (batch_size, retrieval_capacity_pages, page_size, kv_heads, v_dim),
                 dtype=dtype,
                 device=device,
+            )
+            self._ensure_retrieval_cache_pages(
+                layer_state=layer_state,
+                capacity_pages=max(
+                    retrieval_capacity_pages,
+                    int(layer_state.retrieval_cache_capacity_pages),
+                ),
+                page_size=page_size,
+                kv_heads=kv_heads,
+                qk_dim=qk_dim,
+                v_dim=v_dim,
+                device=device,
+                dtype=dtype,
             )
 
         append_key_pages = None
@@ -614,38 +945,19 @@ class RetroInferWaveBufferManager:
                 )
 
             if retrieval_token_len > 0:
-                req_retrieval_keys, req_retrieval_values = fetch_fn(req_pool_idx, retrieval_positions)
-                req_retrieval_keys = req_retrieval_keys.to(
-                    device=device, dtype=dtype, non_blocking=True
-                )
-                req_retrieval_values = req_retrieval_values.to(
-                    device=device, dtype=dtype, non_blocking=True
-                )
-                padded_retrieval = retrieval_capacity_pages * page_size
-                if req_retrieval_keys.shape[0] < padded_retrieval:
-                    pad_k = torch.zeros(
-                        (padded_retrieval - req_retrieval_keys.shape[0], kv_heads, qk_dim),
-                        dtype=dtype,
-                        device=device,
-                    )
-                    pad_v = torch.zeros(
-                        (padded_retrieval - req_retrieval_values.shape[0], kv_heads, v_dim),
-                        dtype=dtype,
-                        device=device,
-                    )
-                    req_retrieval_keys = torch.cat([req_retrieval_keys, pad_k], dim=0)
-                    req_retrieval_values = torch.cat([req_retrieval_values, pad_v], dim=0)
-                retrieval_key_pages[batch_idx].copy_(
-                    req_retrieval_keys.view(retrieval_capacity_pages, page_size, kv_heads, qk_dim)
-                )
-                retrieval_value_pages[batch_idx].copy_(
-                    req_retrieval_values.view(retrieval_capacity_pages, page_size, kv_heads, v_dim)
-                )
-                self._update_retrieval_cache_state(
+                self._materialize_retrieval_pages_with_cache(
                     layer_state=layer_state,
+                    batch_idx=batch_idx,
                     req_pool_idx=int(req_pool_idx),
                     retrieval_positions=retrieval_positions,
-                    cache_slot_lookup_fn=cache_slot_lookup_fn,
+                    retrieval_key_pages=retrieval_key_pages,
+                    retrieval_value_pages=retrieval_value_pages,
+                    fetch_fn=fetch_fn,
+                    device=device,
+                    dtype=dtype,
+                    kv_heads=kv_heads,
+                    qk_dim=qk_dim,
+                    v_dim=v_dim,
                 )
             else:
                 self.clear_layer_retrieval_cache_state(
