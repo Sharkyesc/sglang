@@ -51,7 +51,14 @@ class RetroInferExecutionEngine:
         self.cpu_core_num = int(os.getenv("SGLANG_RETROINFER_CPU_CORES", "8"))
         self.prefill_bsz = int(os.getenv("SGLANG_RETROINFER_PREFILL_BSZ", "4"))
         self.max_new_length_hint = int(os.getenv("SGLANG_RETROINFER_MAX_NEW_LENGTH", "4096"))
+        self.decode_pipeline_enabled = os.getenv(
+            "SGLANG_RETROINFER_DECODE_PIPELINE", "1"
+        ).lower() not in ("0", "false", "no")
+        self.decode_pipeline_microbatch = max(
+            1, int(os.getenv("SGLANG_RETROINFER_DECODE_PIPELINE_BSZ", "1"))
+        )
         self.debug = os.getenv("SGLANG_RETROINFER_DEBUG", "").lower() in ("1", "true", "yes")
+        self._decode_transfer_stream: torch.cuda.Stream | None = None
         self._retro_available = False
         self._warned_unavailable = False
         self._retro_import_logged = False
@@ -65,6 +72,98 @@ class RetroInferExecutionEngine:
         self._partial_refresh_summary_seen: set[
             tuple[tuple[int, ...], int, int, int, int]
         ] = set()
+
+    def _get_decode_transfer_stream(self, device) -> torch.cuda.Stream:
+        if self._decode_transfer_stream is None:
+            self._decode_transfer_stream = torch.cuda.Stream(device=device)
+        return self._decode_transfer_stream
+
+    def _use_decode_pipeline(self, q: torch.Tensor, batch_size: int) -> bool:
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return False
+        except Exception:
+            pass
+        return (
+            self.decode_pipeline_enabled
+            and batch_size > 1
+            and q.is_cuda
+            and torch.cuda.is_available()
+        )
+
+    def _decode_microbatch_slices(self, batch_size: int) -> list[slice]:
+        microbatch = max(1, min(self.decode_pipeline_microbatch, batch_size))
+        return [
+            slice(start, min(batch_size, start + microbatch))
+            for start in range(0, batch_size, microbatch)
+        ]
+
+    def _build_estimation_plans_for_indices(
+        self,
+        req_pool_indices: list[int],
+        batch_indices: range,
+        qv: torch.Tensor,
+        layer,
+        layer_id: int,
+        forward_batch,
+    ) -> list[RetroInferWorkingSetPlan]:
+        estimation_plans: list[RetroInferWorkingSetPlan] = []
+        for batch_idx in batch_indices:
+            req_pool_idx = req_pool_indices[batch_idx]
+            context_kv_len = max(0, int(forward_batch.seq_lens[batch_idx].item()) - 1)
+            if context_kv_len <= 0:
+                estimation_plans.append(
+                    RetroInferWorkingSetPlan(
+                        target_len=0,
+                        sparse_budget=0,
+                        retrieval_budget=0,
+                        estimation_budget=0,
+                        base_positions=torch.empty((0,), dtype=torch.long),
+                        retrieval_positions=torch.empty((0,), dtype=torch.long),
+                        estimation_positions=torch.empty((0,), dtype=torch.long),
+                        estimation_cluster_indices=torch.empty((0,), dtype=torch.long),
+                    )
+                )
+                continue
+            layer_index = self.cpu_store.get_layer_index(int(req_pool_idx), layer_id)
+            estimation_plans.append(
+                self._select_layer_working_set_plan(
+                    layer_index=layer_index,
+                    layer=layer,
+                    kv_len=context_kv_len,
+                    target_len=self._working_set_target_len(context_kv_len),
+                    query_vector=qv[batch_idx, 0],
+                )
+            )
+        return estimation_plans
+
+    def _build_estimation_zone_for_indices(
+        self,
+        req_pool_indices: list[int],
+        batch_indices: range,
+        qv: torch.Tensor,
+        layer,
+        layer_id: int,
+        forward_batch,
+        device,
+        dtype,
+    ):
+        chunk_req_pool_indices = [req_pool_indices[idx] for idx in batch_indices]
+        estimation_plans = self._build_estimation_plans_for_indices(
+            req_pool_indices=req_pool_indices,
+            batch_indices=batch_indices,
+            qv=qv,
+            layer=layer,
+            layer_id=layer_id,
+            forward_batch=forward_batch,
+        )
+        return self._build_estimation_zone_tensors(
+            req_pool_indices=chunk_req_pool_indices,
+            plans=estimation_plans,
+            layer_id=layer_id,
+            device=device,
+            dtype=dtype,
+        )
     def _require_host_only_supported(self) -> None:
         page_size = int(getattr(self.model_runner, "page_size", 1))
         if page_size != 1:
@@ -1072,6 +1171,172 @@ class RetroInferExecutionEngine:
         if not torch.isfinite(lse).any():
             return None
         return output, lse
+
+    def _run_decode_attention_full_batch(
+        self,
+        *,
+        session,
+        qv: torch.Tensor,
+        working_keys: torch.Tensor,
+        working_values: torch.Tensor,
+        live_len: int,
+        layer,
+        layer_id: int,
+        forward_batch,
+        req_pool_indices: list[int],
+    ) -> torch.Tensor:
+        kv_lens = torch.full(
+            (forward_batch.batch_size,),
+            int(live_len),
+            dtype=torch.int32,
+            device=qv.device,
+        )
+        working_output, working_lse = self._materialized_attention_state(
+            q=qv,
+            k=working_keys,
+            v=working_values,
+            layer=layer,
+            kv_lens=kv_lens,
+        )
+
+        batch_indices = range(0, len(req_pool_indices))
+        es_centroids, es_value_sum, es_cluster_size, es_valid_clusters = (
+            self._build_estimation_zone_for_indices(
+                req_pool_indices=req_pool_indices,
+                batch_indices=batch_indices,
+                qv=qv,
+                layer=layer,
+                layer_id=layer_id,
+                forward_batch=forward_batch,
+                device=working_output.device,
+                dtype=working_output.dtype,
+            )
+        )
+        estimation_state = self._estimation_attention_state_from_zone_tensors(
+            q=qv,
+            es_centroids=es_centroids,
+            es_value_sum=es_value_sum,
+            es_cluster_size=es_cluster_size,
+            es_valid_clusters=es_valid_clusters,
+            layer=layer,
+        )
+
+        if estimation_state is not None:
+            estimation_output, estimation_lse = estimation_state
+            output, _ = merge_state(
+                estimation_output,
+                estimation_lse,
+                working_output.squeeze(1),
+                working_lse,
+            )
+            return output.unsqueeze(1)
+        return working_output
+
+    def _run_decode_attention_pipelined(
+        self,
+        *,
+        session,
+        qv: torch.Tensor,
+        working_keys: torch.Tensor,
+        working_values: torch.Tensor,
+        live_len: int,
+        layer,
+        layer_id: int,
+        forward_batch,
+        req_pool_indices: list[int],
+    ) -> torch.Tensor:
+        output = torch.empty(
+            (
+                forward_batch.batch_size,
+                1,
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+            ),
+            dtype=qv.dtype,
+            device=qv.device,
+        )
+        chunks = self._decode_microbatch_slices(forward_batch.batch_size)
+        transfer_stream = self._get_decode_transfer_stream(qv.device)
+        current_stream = torch.cuda.current_stream(qv.device)
+        input_ready_event = torch.cuda.Event()
+        input_ready_event.record(current_stream)
+        events: list[torch.cuda.Event] = []
+        staged_estimation: list[
+            tuple[
+                torch.Tensor | None,
+                torch.Tensor | None,
+                torch.Tensor | None,
+                torch.Tensor | None,
+            ]
+        ] = []
+
+        def schedule_estimation(chunk: slice) -> None:
+            batch_indices = range(int(chunk.start), int(chunk.stop))
+            transfer_stream.wait_event(input_ready_event)
+            with torch.cuda.stream(transfer_stream):
+                staged_estimation.append(
+                    self._build_estimation_zone_for_indices(
+                        req_pool_indices=req_pool_indices,
+                        batch_indices=batch_indices,
+                        qv=qv,
+                        layer=layer,
+                        layer_id=layer_id,
+                        forward_batch=forward_batch,
+                        device=qv.device,
+                        dtype=qv.dtype,
+                    )
+                )
+                event = torch.cuda.Event()
+                event.record(transfer_stream)
+                events.append(event)
+
+        schedule_estimation(chunks[0])
+        for chunk_idx, chunk in enumerate(chunks):
+            q_chunk = qv[chunk]
+            k_chunk = working_keys[chunk]
+            v_chunk = working_values[chunk]
+            kv_lens = torch.full(
+                (int(chunk.stop) - int(chunk.start),),
+                int(live_len),
+                dtype=torch.int32,
+                device=qv.device,
+            )
+            working_output, working_lse = self._materialized_attention_state(
+                q=q_chunk,
+                k=k_chunk,
+                v=v_chunk,
+                layer=layer,
+                kv_lens=kv_lens,
+            )
+
+            if chunk_idx + 1 < len(chunks):
+                schedule_estimation(chunks[chunk_idx + 1])
+
+            current_stream.wait_event(events[chunk_idx])
+            es_centroids, es_value_sum, es_cluster_size, es_valid_clusters = (
+                staged_estimation[chunk_idx]
+            )
+            estimation_state = self._estimation_attention_state_from_zone_tensors(
+                q=q_chunk,
+                es_centroids=es_centroids,
+                es_value_sum=es_value_sum,
+                es_cluster_size=es_cluster_size,
+                es_valid_clusters=es_valid_clusters,
+                layer=layer,
+            )
+            if estimation_state is not None:
+                estimation_output, estimation_lse = estimation_state
+                chunk_output, _ = merge_state(
+                    estimation_output,
+                    estimation_lse,
+                    working_output.squeeze(1),
+                    working_lse,
+                )
+                output[chunk].copy_(chunk_output.unsqueeze(1))
+            else:
+                output[chunk].copy_(working_output)
+
+        return output
 
     def _materialized_attention_state(
         self,
@@ -2406,77 +2671,31 @@ class RetroInferExecutionEngine:
                 f"RetroInfer working-set buffers missing for session={session.key} layer={layer_id}"
             )
         working_keys, working_values, live_len = buffer_view
-        kv_lens = torch.full(
-            (forward_batch.batch_size,),
-            int(live_len),
-            dtype=torch.int32,
-            device=qv.device,
-        )
-        working_output, working_lse = self._materialized_attention_state(
-            q=qv,
-            k=working_keys,
-            v=working_values,
-            layer=layer,
-            kv_lens=kv_lens,
-        )
 
-        estimation_plans: list[RetroInferWorkingSetPlan] = []
-        for batch_idx, req_pool_idx in enumerate(req_pool_indices):
-            context_kv_len = max(0, int(forward_batch.seq_lens[batch_idx].item()) - 1)
-            if context_kv_len <= 0:
-                estimation_plans.append(
-                    RetroInferWorkingSetPlan(
-                        target_len=0,
-                        sparse_budget=0,
-                        retrieval_budget=0,
-                        estimation_budget=0,
-                        base_positions=torch.empty((0,), dtype=torch.long),
-                        retrieval_positions=torch.empty((0,), dtype=torch.long),
-                        estimation_positions=torch.empty((0,), dtype=torch.long),
-                        estimation_cluster_indices=torch.empty((0,), dtype=torch.long),
-                    )
-                )
-                continue
-            layer_index = self.cpu_store.get_layer_index(int(req_pool_idx), layer_id)
-            estimation_plans.append(
-                self._select_layer_working_set_plan(
-                    layer_index=layer_index,
-                    layer=layer,
-                    kv_len=context_kv_len,
-                    target_len=self._working_set_target_len(context_kv_len),
-                    query_vector=qv[batch_idx, 0],
-                )
-            )
-
-        es_centroids, es_value_sum, es_cluster_size, es_valid_clusters = (
-            self._build_estimation_zone_tensors(
-                req_pool_indices=req_pool_indices,
-                plans=estimation_plans,
+        if self._use_decode_pipeline(qv, forward_batch.batch_size):
+            output = self._run_decode_attention_pipelined(
+                session=session,
+                qv=qv,
+                working_keys=working_keys,
+                working_values=working_values,
+                live_len=live_len,
+                layer=layer,
                 layer_id=layer_id,
-                device=working_output.device,
-                dtype=working_output.dtype,
+                forward_batch=forward_batch,
+                req_pool_indices=req_pool_indices,
             )
-        )
-        estimation_state = self._estimation_attention_state_from_zone_tensors(
-            q=qv,
-            es_centroids=es_centroids,
-            es_value_sum=es_value_sum,
-            es_cluster_size=es_cluster_size,
-            es_valid_clusters=es_valid_clusters,
-            layer=layer,
-        )
-
-        if estimation_state is not None:
-            estimation_output, estimation_lse = estimation_state
-            output, _ = merge_state(
-                estimation_output,
-                estimation_lse,
-                working_output.squeeze(1),
-                working_lse,
-            )
-            output = output.unsqueeze(1)
         else:
-            output = working_output
+            output = self._run_decode_attention_full_batch(
+                session=session,
+                qv=qv,
+                working_keys=working_keys,
+                working_values=working_values,
+                live_len=live_len,
+                layer=layer,
+                layer_id=layer_id,
+                forward_batch=forward_batch,
+                req_pool_indices=req_pool_indices,
+            )
         # Full GPU KV is intentionally not maintained in RetroInfer's host-first
         # mode, so retrieval scatter-back is disabled.
         return output.view(forward_batch.batch_size, -1)

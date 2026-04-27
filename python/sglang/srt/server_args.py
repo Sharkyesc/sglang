@@ -2967,7 +2967,9 @@ class ServerArgs:
             type=str,
             help=(
                 "JSON config for the sparse_auto attention backend, for example "
-                '\'{"dense_fallback_backend":"triton","retroinfer_min_decode_seq_len":4096}\''
+                '\'{"dense_fallback_backend":"triton","latency_budget_ms":20,'
+                '"memory_budget_mb":4096,"target_sparsity":0.2,'
+                '"enable_online_profiling":true}\''
             ),
         )
         parser.add_argument(
