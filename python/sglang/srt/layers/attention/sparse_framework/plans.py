@@ -16,6 +16,7 @@ class ExecutionPlan:
     working_set_budget_tokens: int | None = None
     enable_host_backup_on_evict: bool = False
     enable_physical_eviction: bool = False
+    validate_kv_cache: bool = False
     ops: list[object] = field(default_factory=list)
 
     @property

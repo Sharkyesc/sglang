@@ -17,6 +17,8 @@ class SparseFrameworkConfig:
     working_set_budget_tokens: int | None = None
     enable_host_backup_on_evict: bool = False
     enable_physical_eviction: bool = False
+    validate_kv_cache: bool = False
+    profiler_config: dict[str, Any] | None = None
 
     @classmethod
     def from_server_args(cls, server_args: Any) -> "SparseFrameworkConfig":
@@ -43,6 +45,12 @@ class SparseFrameworkConfig:
         if not isinstance(selection, list):
             logger.warning("Invalid selection config; using full dense selection.")
             selection = [{"type": "full"}]
+        profiler_config = data.get("profiler")
+        if isinstance(profiler_config, bool):
+            profiler_config = {"enabled": profiler_config}
+        elif profiler_config is not None and not isinstance(profiler_config, dict):
+            logger.warning("Invalid sparse framework profiler config; disabling profiler.")
+            profiler_config = None
         return cls(
             selection=selection,
             combine=str(data.get("combine", "union")),
@@ -55,4 +63,8 @@ class SparseFrameworkConfig:
             ),
             enable_host_backup_on_evict=bool(data.get("enable_host_backup_on_evict", False)),
             enable_physical_eviction=bool(data.get("enable_physical_eviction", False)),
+            validate_kv_cache=bool(
+                data.get("validate_kv_cache", data.get("debug_validate_kv_cache", False))
+            ),
+            profiler_config=profiler_config,
         )

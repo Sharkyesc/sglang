@@ -437,7 +437,7 @@ class RadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self._free_valid_kv_indices(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
@@ -445,6 +445,15 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        if self._has_offloaded_kv_indices(kv_indices):
+            self._free_valid_kv_indices(kv_indices[req.cache_protected_len :])
+            self.req_to_token_pool.free(req.req_pool_idx)
+            if req.last_node is not None:
+                self.dec_lock_ref(req.last_node)
+                req.last_node = None
+            req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+            req.cache_protected_len = 0
+            return
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
@@ -493,6 +502,8 @@ class RadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        if self._has_offloaded_kv_indices(kv_indices):
+            return
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
@@ -618,6 +629,30 @@ class RadixCache(BasePrefixCache):
     def protected_size(self):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
+
+    def _has_offloaded_kv_indices(self, kv_indices: torch.Tensor) -> bool:
+        return bool((kv_indices < 0).any().item())
+
+    def _free_valid_kv_indices(self, kv_indices: torch.Tensor) -> None:
+        valid_indices = kv_indices[kv_indices >= 0]
+        sparse_freed_slots = getattr(
+            self.token_to_kv_pool_allocator,
+            "_sparse_framework_freed_slots",
+            None,
+        )
+        if sparse_freed_slots and valid_indices.numel() > 0:
+            valid_list = [
+                int(x)
+                for x in valid_indices.detach().cpu().tolist()
+                if int(x) not in sparse_freed_slots
+            ]
+            if not valid_list:
+                return
+            valid_indices = torch.tensor(
+                valid_list, dtype=valid_indices.dtype, device=valid_indices.device
+            )
+        if valid_indices.numel() > 0:
+            self.token_to_kv_pool_allocator.free(valid_indices)
 
     def all_values_flatten(self):
         values = []

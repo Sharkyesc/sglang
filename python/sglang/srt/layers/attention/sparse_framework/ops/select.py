@@ -31,9 +31,8 @@ class SelectOp(BaseSparseOp):
         selection_contributions = []
         req_to_token = ctx.req_to_token_pool.req_to_token
 
-        for request_index, seq_len_tensor in enumerate(ctx.seq_lens):
-            seq_len = int(seq_len_tensor.item())
-            req_pool_idx = int(ctx.req_pool_indices[request_index].item())
+        for request_index, seq_len in enumerate(ctx.seq_lens_cpu):
+            req_pool_idx = int(ctx.req_pool_indices_cpu[request_index])
             positions = self._positions_for_request(
                 plan.specs,
                 plan.combine,
@@ -254,8 +253,7 @@ class SelectOp(BaseSparseOp):
         if manager is None:
             manager = HeavyHitterStateManager()
             framework_state["heavy_hitter_manager"] = manager
-        active_reqs = [int(x) for x in ctx.req_pool_indices.tolist()]
-        manager.drop_missing_requests(active_reqs)
+        manager.drop_missing_requests(ctx.req_pool_indices_cpu)
         positions = manager.select_positions(
             spec,
             req_pool_idx=req_pool_idx,

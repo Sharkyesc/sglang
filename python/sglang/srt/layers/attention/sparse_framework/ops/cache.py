@@ -27,8 +27,7 @@ class CacheOp(BaseSparseOp):
         misses = []
         active_keys = set()
         selected_cache_keys = []
-        req_pool_indices = [int(x) for x in ctx.req_pool_indices.tolist()]
-        for batch_idx, req_pool_idx in enumerate(req_pool_indices):
+        for batch_idx, req_pool_idx in enumerate(ctx.req_pool_indices_cpu):
             batch_keys = []
             if batch_idx >= len(selected_positions) or batch_idx >= len(selected_kv_indices):
                 selected_cache_keys.append(batch_keys)
@@ -50,7 +49,7 @@ class CacheOp(BaseSparseOp):
                             last_access_step=step,
                             access_count=1,
                         )
-                        table.entries[key] = entry
+                        table.add_entry(entry)
                     else:
                         entry.last_access_step = step
                         entry.access_count += 1

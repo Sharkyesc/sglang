@@ -49,6 +49,7 @@ class PlanCompiler:
             working_set_budget_tokens=self.config.working_set_budget_tokens,
             enable_host_backup_on_evict=self.config.enable_host_backup_on_evict,
             enable_physical_eviction=self.config.enable_physical_eviction,
+            validate_kv_cache=self.config.validate_kv_cache,
         )
         self._infer_strategy(execution_plan)
 

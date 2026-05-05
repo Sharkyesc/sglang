@@ -14,6 +14,7 @@ class RequestLayerKV:
     capacity: int = 0
     pinned: bool = False
     version: int = 0
+    pending_events: dict[int, torch.cuda.Event] = field(default_factory=dict)
 
     def ensure_capacity(
         self,
@@ -25,6 +26,7 @@ class RequestLayerKV:
     ) -> None:
         if self.capacity >= needed:
             return
+        self.synchronize_pending()
 
         new_capacity = max(16, needed, self.capacity * 2)
         new_key_buffer, key_pinned = _empty_cpu_buffer(
@@ -46,21 +48,59 @@ class RequestLayerKV:
         self.capacity = new_capacity
         self.pinned = bool(key_pinned and value_pinned)
 
-    def put_row(self, position: int, key: torch.Tensor, value: torch.Tensor) -> None:
+    def put_row(
+        self,
+        position: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        copy_stream: torch.cuda.Stream | None = None,
+    ) -> None:
         pos = int(position)
         offset = self.position_to_offset.get(pos)
         if offset is None:
             offset = self.size
             self.position_to_offset[pos] = offset
             self.size += 1
+        else:
+            self.wait_position(pos)
 
         assert self.key_buffer is not None
         assert self.value_buffer is not None
-        # Keep CPU-store snapshots immediately visible to the next decode step.
-        # Async D2H into pinned memory needs explicit event/stream tracking; this
-        # prototype uses blocking copies for correctness first.
-        self.key_buffer[offset].copy_(key.detach().to("cpu", non_blocking=False))
-        self.value_buffer[offset].copy_(value.detach().to("cpu", non_blocking=False))
+        if copy_stream is None:
+            self.key_buffer[offset].copy_(key.detach().to("cpu", non_blocking=False))
+            self.value_buffer[offset].copy_(value.detach().to("cpu", non_blocking=False))
+            self.pending_events.pop(pos, None)
+            return
+
+        with torch.cuda.stream(copy_stream):
+            self.key_buffer[offset].copy_(key.detach(), non_blocking=True)
+            self.value_buffer[offset].copy_(value.detach(), non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(copy_stream)
+        self.pending_events[pos] = event
+
+    def has_position_ready(self, position: int) -> bool:
+        pos = int(position)
+        if pos not in self.position_to_offset:
+            return False
+        event = self.pending_events.get(pos)
+        if event is None:
+            return True
+        if not event.query():
+            return False
+        del self.pending_events[pos]
+        return True
+
+    def wait_position(self, position: int) -> None:
+        event = self.pending_events.pop(int(position), None)
+        if event is not None:
+            event.synchronize()
+
+    def synchronize_pending(self) -> None:
+        for event in self.pending_events.values():
+            event.synchronize()
+        self.pending_events.clear()
 
     def get_offsets(self, positions: list[int]) -> tuple[list[int], list[int], list[int]]:
         offsets = []
@@ -88,6 +128,7 @@ class SparseCPUKVStore:
 
     def __init__(self):
         self.layers: dict[tuple[int, int], RequestLayerKV] = {}
+        self.copy_streams: dict[torch.device, torch.cuda.Stream] = {}
 
     def drop_request(self, req_pool_idx: int) -> int:
         req_pool_idx = int(req_pool_idx)
@@ -95,6 +136,7 @@ class SparseCPUKVStore:
             key for key in self.layers.keys() if int(key[0]) == req_pool_idx
         ]
         for key in keys_to_drop:
+            self.layers[key].synchronize_pending()
             del self.layers[key]
         return len(keys_to_drop)
 
@@ -129,8 +171,14 @@ class SparseCPUKVStore:
             value_rows.dtype,
         )
         written = 0
+        copy_stream = self._copy_stream_for(key_rows, entry)
         for offset, position in enumerate(positions[:max_rows]):
-            entry.put_row(int(position), key_rows[offset], value_rows[offset])
+            entry.put_row(
+                int(position),
+                key_rows[offset],
+                value_rows[offset],
+                copy_stream=copy_stream,
+            )
             written += 1
         entry.version += 1
         return written
@@ -153,6 +201,8 @@ class SparseCPUKVStore:
         )
         if not offsets:
             return None, None, found_positions, missing_positions
+        for position in found_positions:
+            entry.wait_position(position)
 
         offset_tensor = torch.tensor(offsets, dtype=torch.long)
         key_rows = entry.key_buffer.index_select(0, offset_tensor)
@@ -196,16 +246,52 @@ class SparseCPUKVStore:
         entries = 0
         capacity = 0
         pinned_layers = 0
+        pending_copies = 0
         for layer_store in self.layers.values():
             entries += layer_store.size
             capacity += layer_store.capacity
             pinned_layers += int(layer_store.pinned)
+            pending_copies += len(layer_store.pending_events)
         return {
             "request_layers": len(self.layers),
             "tokens": entries,
             "capacity": capacity,
             "pinned_layers": pinned_layers,
+            "pending_copies": pending_copies,
         }
+
+    def has_complete_ready_backup(
+        self,
+        *,
+        req_pool_idx: int,
+        position: int,
+        expected_layers: int | None,
+    ) -> bool:
+        if expected_layers is None:
+            return False
+        for layer_id in range(int(expected_layers)):
+            layer_store = self.layers.get((int(req_pool_idx), int(layer_id)))
+            if layer_store is None or not layer_store.has_position_ready(position):
+                return False
+        return True
+
+    def _copy_stream_for(
+        self,
+        key_rows: torch.Tensor,
+        entry: RequestLayerKV,
+    ) -> torch.cuda.Stream | None:
+        if (
+            not entry.pinned
+            or key_rows.device.type != "cuda"
+            or not torch.cuda.is_available()
+        ):
+            return None
+        device = key_rows.device
+        stream = self.copy_streams.get(device)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self.copy_streams[device] = stream
+        return stream
 
 
 def _empty_cpu_buffer(

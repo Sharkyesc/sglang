@@ -135,12 +135,8 @@ class EvictOp(BaseSparseOp):
         for req_pool_idx, position, _ in free_plan:
             if 0 <= position < int(req_to_token.shape[1]):
                 req_to_token[req_pool_idx, position] = -1
-            for table_entry in table.entries.values():
-                if (
-                    int(table_entry.req_pool_idx) == req_pool_idx
-                    and int(table_entry.position) == position
-                    and table_entry.state == "gpu"
-                ):
+            for table_entry in table.entries_for_token(req_pool_idx, position):
+                if table_entry.state == "gpu":
                     table.mark_sparse_cpu_backup(
                         table_entry,
                         keep_device_index=False,
@@ -165,9 +161,8 @@ class EvictOp(BaseSparseOp):
         selected_positions = []
         if state is not None:
             selected_positions = state.get("selected_positions") or []
-        req_pool_indices = [int(x) for x in ctx.req_pool_indices.tolist()]
         active = set()
-        for batch_idx, req_pool_idx in enumerate(req_pool_indices):
+        for batch_idx, req_pool_idx in enumerate(ctx.req_pool_indices_cpu):
             if batch_idx >= len(selected_positions):
                 continue
             for pos in selected_positions[batch_idx].detach().cpu().tolist():

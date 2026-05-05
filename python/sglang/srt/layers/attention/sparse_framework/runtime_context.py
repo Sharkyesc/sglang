@@ -18,6 +18,9 @@ class SparseRuntimeContext:
     model_runner: "ModelRunner"
     seq_lens: torch.Tensor
     req_pool_indices: torch.Tensor
+    seq_lens_cpu: list[int]
+    req_pool_indices_cpu: list[int]
+    out_cache_locs_cpu: list[int]
     req_to_token_pool: Any
     token_to_kv_pool: Any
     host_pool: Any | None = None
@@ -51,6 +54,19 @@ class SparseRuntimeContext:
             model_runner=model_runner,
             seq_lens=forward_batch.seq_lens,
             req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens_cpu=_forward_batch_cpu_list(
+                forward_batch,
+                "seq_lens_cpu",
+                fallback_name="seq_lens",
+            ),
+            req_pool_indices_cpu=_forward_batch_cpu_list(
+                forward_batch,
+                "req_pool_indices",
+            ),
+            out_cache_locs_cpu=_forward_batch_cpu_list(
+                forward_batch,
+                "out_cache_loc",
+            ),
             req_to_token_pool=forward_batch.req_to_token_pool,
             token_to_kv_pool=forward_batch.token_to_kv_pool,
             host_pool=host_pool,
@@ -62,3 +78,33 @@ class SparseRuntimeContext:
             kwargs=kwargs,
             framework_state=framework_state,
         )
+
+
+def _forward_batch_cpu_list(
+    forward_batch: "ForwardBatch",
+    name: str,
+    *,
+    fallback_name: str | None = None,
+) -> list[int]:
+    cache = getattr(forward_batch, "_sparse_framework_cpu_lists", None)
+    if cache is None:
+        cache = {}
+        setattr(forward_batch, "_sparse_framework_cpu_lists", cache)
+    cache_key = (name, fallback_name)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    values = _tensor_or_list_to_ints(getattr(forward_batch, name, None))
+    if not values and fallback_name is not None:
+        values = _tensor_or_list_to_ints(getattr(forward_batch, fallback_name, None))
+    cache[cache_key] = values
+    return values
+
+
+def _tensor_or_list_to_ints(value: Any | None) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        return [int(x) for x in value.detach().cpu().tolist()]
+    return [int(x) for x in value]

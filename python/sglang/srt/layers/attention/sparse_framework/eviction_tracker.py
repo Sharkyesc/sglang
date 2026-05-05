@@ -88,6 +88,15 @@ class TokenEvictionTracker:
     ) -> bool:
         if cpu_store is None or expected_layers is None:
             return False
+        ready = getattr(cpu_store, "has_complete_ready_backup", None)
+        if callable(ready):
+            return bool(
+                ready(
+                    req_pool_idx=req_pool_idx,
+                    position=position,
+                    expected_layers=expected_layers,
+                )
+            )
         for layer_id in range(int(expected_layers)):
             layer_store = cpu_store.layers.get((int(req_pool_idx), int(layer_id)))
             if layer_store is None:

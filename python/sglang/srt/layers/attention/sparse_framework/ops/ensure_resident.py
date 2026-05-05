@@ -29,11 +29,9 @@ def ensure_full_kv_resident(ctx, state: dict) -> dict:
     sparse_cpu_entries: list[KVResidencyEntry] = []
     missing_entries: list[tuple[int, int, int]] = []
 
-    req_pool_indices = [int(x) for x in ctx.req_pool_indices.tolist()]
-    seq_lens = [int(x) for x in ctx.seq_lens.tolist()]
     req_to_token = ctx.req_to_token_pool.req_to_token
 
-    for req_pool_idx, seq_len in zip(req_pool_indices, seq_lens):
+    for req_pool_idx, seq_len in zip(ctx.req_pool_indices_cpu, ctx.seq_lens_cpu):
         for position in range(seq_len):
             entry = table.get(req_pool_idx, layer_id, position)
             if entry is None:
@@ -75,11 +73,19 @@ def ensure_full_kv_resident(ctx, state: dict) -> dict:
         layer,
         sparse_cpu_entries,
     )
+    prefetched = _consume_or_wait_pending_host_entries(ctx, host_entries, layer_id)
+    if prefetched:
+        host_entries = [
+            entry
+            for entry in host_entries
+            if entry.state != "gpu" or entry.device_index is None
+        ]
 
     if not host_entries:
         result = {
-            "needed": len(sparse_cpu_entries),
-            "fetched": int(sparse_cpu_result["restored"]),
+            "needed": len(sparse_cpu_entries) + int(prefetched),
+            "fetched": int(sparse_cpu_result["restored"]) + int(prefetched),
+            "prefetch_consumed": int(prefetched),
             "sparse_cpu": sparse_cpu_result,
         }
         state["ensure_full_resident"] = result
@@ -116,8 +122,9 @@ def ensure_full_kv_resident(ctx, state: dict) -> dict:
 
     result = {
         "needed": len(host_entries) + len(sparse_cpu_entries),
-        "fetched": len(host_entries) + int(sparse_cpu_result["restored"]),
+        "fetched": len(host_entries) + int(sparse_cpu_result["restored"]) + int(prefetched),
         "producer_id": producer_id,
+        "prefetch_consumed": int(prefetched),
         "host_pool": {"needed": len(host_entries), "fetched": len(host_entries)},
         "sparse_cpu": sparse_cpu_result,
     }
@@ -227,13 +234,50 @@ def _host_indices_tensor(indices: list[int], ctx) -> torch.Tensor:
     return torch.tensor(indices, dtype=torch.long, device=device)
 
 
-def _consume_sparse_load_ack(cache_controller) -> None:
+def _consume_or_wait_pending_host_entries(ctx, entries, layer_id: int) -> int:
+    if not entries or ctx.framework_state is None or ctx.cache_controller is None:
+        return 0
+    pending = ctx.framework_state.get("host_kv_prefetches") or {}
+    if not pending:
+        return 0
+
+    layer_done_counter = getattr(ctx.cache_controller, "layer_done_counter", None)
+    if layer_done_counter is None:
+        return 0
+    table = get_residency_table(ctx.framework_state)
+    req_to_token = ctx.req_to_token_pool.req_to_token
+    consumed = 0
+    for entry in entries:
+        key = (int(entry.req_pool_idx), int(entry.layer_id), int(entry.position))
+        item = pending.get(key)
+        if item is None:
+            continue
+        producer_id = int(item["producer_id"])
+        if producer_id >= 0:
+            layer_done_counter.set_consumer(producer_id)
+            layer_done_counter.wait_until(layer_id)
+        device_index = int(item["device_indices"][int(item["offset"])].item())
+        table.mark_gpu(entry, device_index=device_index)
+        req_to_token[entry.req_pool_idx, entry.position] = device_index
+        del pending[key]
+        consumed += 1
+    if consumed:
+        _consume_sparse_load_ack(ctx.cache_controller, only_finished=True)
+    return consumed
+
+
+def _consume_sparse_load_ack(cache_controller, *, only_finished: bool = False) -> None:
     ack_queue = getattr(cache_controller, "ack_load_queue", None)
     if not ack_queue:
         return
 
     cleaned_queue = []
     for ack in ack_queue:
+        if only_finished:
+            query = getattr(ack.finish_event, "query", None)
+            if callable(query) and not query():
+                cleaned_queue.append(ack)
+                continue
         node_ids = list(getattr(ack, "node_ids", []))
         if -1 not in node_ids:
             cleaned_queue.append(ack)

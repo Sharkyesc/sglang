@@ -15,6 +15,10 @@ from sglang.srt.layers.attention.sparse_framework.kv_store import get_cpu_kv_sto
 from sglang.srt.layers.attention.sparse_framework.ops.ensure_resident import (
     ensure_full_kv_resident,
 )
+from sglang.srt.layers.attention.sparse_framework.profiler import (
+    SparseFrameworkProfiler,
+    SparseProfilerConfig,
+)
 from sglang.srt.layers.attention.sparse_framework.residency import get_residency_table
 from sglang.srt.layers.attention.sparse_framework.runtime_context import (
     SparseRuntimeContext,
@@ -43,6 +47,9 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         self.last_execution_plan = None
         self.last_selection_state: dict | None = None
         self.framework_state: dict = {}
+        self.profiler = SparseFrameworkProfiler(
+            SparseProfilerConfig.from_dict(self.config.profiler_config)
+        )
         self._logged_init = False
         self._logged_plan_signatures: set[tuple] = set()
         self._runtime_log_count = 0
@@ -227,7 +234,12 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         plan = self.last_execution_plan or self.compiler.compile(ctx)
         state = {"execution_plan": plan}
         for op in plan.ops:
-            op.run(ctx, state)
+            op_name = type(op).__name__
+            with self.profiler.record(f"sparse_framework/{op_name}"):
+                op.run(ctx, state)
+        self.profiler.step()
+        if self.profiler.enabled:
+            state["profiler"] = self.profiler.state()
         self.last_selection_state = state
         return state
 
@@ -254,13 +266,15 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         self._logged_init = True
         logger.info(
             "Sparse framework backend initialized: fallback=%s selection=%s combine=%s "
-            "working_set_budget_tokens=%s host_backup_on_evict=%s physical_eviction=%s",
+            "working_set_budget_tokens=%s host_backup_on_evict=%s physical_eviction=%s "
+            "profiler=%s",
             self.config.dense_fallback_backend,
             self.config.selection,
             self.config.combine,
             self.config.working_set_budget_tokens,
             self.config.enable_host_backup_on_evict,
             self.config.enable_physical_eviction,
+            self.profiler.enabled,
         )
 
     def _log_plan_once(self, forward_batch, plan) -> None:
@@ -319,7 +333,7 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             "fallback_reason=%s subset_unavailable_reason=%s selected_kv_counts=%s "
             "selection_contributions=%s cache_result=%s fetch_result=%s "
             "evict_result=%s working_set_result=%s extend_store_result=%s "
-            "cpu_kv_store=%s forward_mode=%s",
+            "cpu_kv_store=%s forward_mode=%s profiler=%s",
             phase,
             layer_id,
             path,
@@ -335,6 +349,7 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             state.get("extend_store_result"),
             self._cpu_kv_store_stats(),
             getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode)),
+            state.get("profiler"),
         )
 
     def _store_extend_kv_to_cpu(

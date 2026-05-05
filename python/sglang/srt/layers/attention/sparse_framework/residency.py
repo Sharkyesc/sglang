@@ -41,6 +41,7 @@ class KVResidencyEntry:
 class KVResidencyTable:
     def __init__(self):
         self.entries: dict[tuple[int, int, int], KVResidencyEntry] = {}
+        self.entries_by_token: dict[tuple[int, int], set[tuple[int, int, int]]] = {}
         self.step = 0
 
     def next_step(self) -> int:
@@ -54,6 +55,27 @@ class KVResidencyTable:
         self, req_pool_idx: int, layer_id: int, position: int
     ) -> KVResidencyEntry | None:
         return self.entries.get(self.key(req_pool_idx, layer_id, position))
+
+    def add_entry(self, entry: KVResidencyEntry) -> None:
+        key = self.key(entry.req_pool_idx, entry.layer_id, entry.position)
+        self.entries[key] = entry
+        token_key = (int(entry.req_pool_idx), int(entry.position))
+        self.entries_by_token.setdefault(token_key, set()).add(key)
+
+    def entries_for_token(
+        self, req_pool_idx: int, position: int
+    ) -> list[KVResidencyEntry]:
+        token_key = (int(req_pool_idx), int(position))
+        keys = self.entries_by_token.get(token_key)
+        if keys is None:
+            keys = {
+                key
+                for key in self.entries
+                if int(key[0]) == int(req_pool_idx) and int(key[2]) == int(position)
+            }
+            if keys:
+                self.entries_by_token[token_key] = keys
+        return [self.entries[key] for key in keys or () if key in self.entries]
 
     def observe_gpu(
         self,
@@ -77,7 +99,7 @@ class KVResidencyTable:
                 last_access_step=step,
                 access_count=1,
             )
-            self.entries[key] = entry
+            self.add_entry(entry)
             return entry, True
         if entry.state == "gpu":
             entry.device_index = int(device_index)
@@ -153,6 +175,12 @@ class KVResidencyTable:
         ]
         for key in keys_to_drop:
             del self.entries[key]
+            token_key = (int(key[0]), int(key[2]))
+            token_entries = self.entries_by_token.get(token_key)
+            if token_entries is not None:
+                token_entries.discard(key)
+                if not token_entries:
+                    del self.entries_by_token[token_key]
         return len(keys_to_drop)
 
     def eviction_candidates(

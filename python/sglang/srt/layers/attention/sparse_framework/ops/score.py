@@ -20,8 +20,7 @@ class ScoreUpdateOp(BaseSparseOp):
         layer_id = getattr(ctx.layer, "layer_id", None)
         if layer_id is None:
             return None
-        req_pool_indices = [int(x) for x in ctx.req_pool_indices.tolist()]
-        for batch_idx, req_pool_idx in enumerate(req_pool_indices):
+        for batch_idx, req_pool_idx in enumerate(ctx.req_pool_indices_cpu):
             manager.update_scores(
                 req_pool_idx=req_pool_idx,
                 layer_id=layer_id,
