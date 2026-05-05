@@ -248,3 +248,15 @@ def create_sparse_auto_backend(runner):
     from sglang.srt.layers.attention.sparse_auto_backend import SparseAutoAttnBackend
 
     return SparseAutoAttnBackend(runner)
+
+@register_attention_backend("sparse_framework")
+def create_sparse_framework_backend(runner):
+    from sglang.srt.layers.attention.sparse_framework import SparseFrameworkAttnBackend
+
+    return SparseFrameworkAttnBackend(runner)
+
+@register_attention_backend("sparse")
+def create_sparse_backend(runner):
+    from sglang.srt.layers.attention.sparse_framework import SparseFrameworkAttnBackend
+
+    return SparseFrameworkAttnBackend(runner)

@@ -114,6 +114,8 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "nsa",
     "sparse_auto",
+    "sparse_framework",
+    "sparse",
     "h2o",
     # NVIDIA specific
     "cutlass_mla",
@@ -386,6 +388,7 @@ class ServerArgs:
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
     sparse_attention_config: str = "{}"
+    sparse_selection_config: str = "{}"
     enable_flashinfer_autotune: bool = False
 
     # Speculative decoding
@@ -2970,6 +2973,18 @@ class ServerArgs:
                 '\'{"dense_fallback_backend":"triton","latency_budget_ms":20,'
                 '"memory_budget_mb":4096,"target_sparsity":0.2,'
                 '"enable_online_profiling":true}\''
+            ),
+        )
+        parser.add_argument(
+            "--sparse-selection-config",
+            default=ServerArgs.sparse_selection_config,
+            type=str,
+            help=(
+                "JSON config for the sparse_framework attention backend. "
+                "Users describe KV selection semantics; execution details are inferred. "
+                'Example: \'{"selection":[{"type":"fixed","ranges":[[0,4],[-8,-1]]},'
+                '{"type":"sliding_window","window_size":1024}],"combine":"union",'
+                '"fallback":"dense"}\''
             ),
         )
         parser.add_argument(

@@ -165,11 +165,6 @@ class RetroInferExecutionEngine:
             dtype=dtype,
         )
     def _require_host_only_supported(self) -> None:
-        page_size = int(getattr(self.model_runner, "page_size", 1))
-        if page_size != 1:
-            raise RuntimeError(
-                "RetroInfer CPU-resident full KV mode currently supports page_size=1 only."
-            )
         if not self.cpu_store.kv_store.is_bound():
             raise RuntimeError(
                 "RetroInfer CPU-resident full KV mode requires --enable-hierarchical-cache "

@@ -151,11 +151,20 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
+        sparse_freed_slots = getattr(self, "_sparse_framework_freed_slots", None)
+        if sparse_freed_slots:
+            sparse_freed_slots.difference_update(
+                int(x) for x in select_index.detach().cpu().tolist()
+            )
         return select_index
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        if getattr(self, "_sparse_framework_physical_eviction_active", False):
+            free_index = self._filter_duplicate_free_indices(free_index)
+            if free_index.numel() == 0:
+                return
 
         if self.is_not_in_free_group:
             if self.need_sort:
@@ -170,6 +179,26 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def _filter_duplicate_free_indices(self, free_index: torch.Tensor) -> torch.Tensor:
+        existing = set()
+        if self.free_pages is not None and self.free_pages.numel() > 0:
+            existing.update(int(x) for x in self.free_pages.detach().cpu().tolist())
+        if self.release_pages is not None and self.release_pages.numel() > 0:
+            existing.update(int(x) for x in self.release_pages.detach().cpu().tolist())
+        if not existing:
+            return free_index
+
+        keep = [
+            int(x)
+            for x in free_index.detach().cpu().tolist()
+            if int(x) not in existing
+        ]
+        if len(keep) == int(free_index.numel()):
+            return free_index
+        if not keep:
+            return free_index.new_empty((0,), dtype=free_index.dtype)
+        return torch.tensor(keep, dtype=free_index.dtype, device=free_index.device)
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):

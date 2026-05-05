@@ -142,9 +142,35 @@ class RetroInferHiCacheKVStore(RetroInferKVStore):
         if flat_indices.numel() == 0:
             return tuple()
         page_size = max(1, int(self.page_size))
-        return tuple(int(flat_indices[idx].item()) for idx in range(0, flat_indices.numel(), page_size))
+        return tuple(
+            int(flat_indices[idx].item())
+            for idx in range(0, flat_indices.numel(), page_size)
+        )
 
-    def _pad_device_indices(self, device_indices: torch.Tensor, aligned_len: int) -> torch.Tensor:
+    def _host_indices_for_aligned_range(
+        self,
+        host_indices: tuple[int, ...],
+        start_pos: int,
+        end_pos: int,
+    ) -> torch.Tensor:
+        if end_pos <= start_pos:
+            return torch.empty((0,), dtype=torch.int64)
+        if start_pos < 0 or end_pos > len(host_indices):
+            raise RuntimeError(
+                "RetroInfer host KV staging range exceeds allocated host pages "
+                f"(start_pos={start_pos}, end_pos={end_pos}, "
+                f"allocated={len(host_indices)})."
+            )
+        return torch.tensor(
+            host_indices[start_pos:end_pos],
+            dtype=torch.int64,
+        )
+
+    def _pad_device_indices(
+        self,
+        device_indices: torch.Tensor,
+        aligned_len: int,
+    ) -> torch.Tensor:
         if aligned_len <= int(device_indices.numel()):
             return device_indices
         if device_indices.numel() == 0:
@@ -324,21 +350,24 @@ class RetroInferHiCacheKVStore(RetroInferKVStore):
     ) -> RetroInferRequestHostKVState:
         """Append newly materialized GPU KV slots to the host KV source of truth.
 
-        This is intentionally conservative and currently targets the host-only
-        RetroInfer MVP where page_size=1. In that mode GPU slots are only a
-        transient staging arena, while the host pool owns the full request KV.
+        GPU slots are a transient staging arena, while the host pool owns the
+        full request KV. Host allocations are page-aligned, but stored_upto and
+        source_token_indices track only real request tokens.
         """
         if not self.is_bound():
             raise RuntimeError("RetroInfer host KV store is not bound to a host pool.")
-        if self.page_size != 1:
-            raise RuntimeError(
-                "RetroInfer host-only incremental staging currently requires page_size=1."
-            )
 
         device_indices = device_indices.to(torch.int64).contiguous()
         append_len = int(device_indices.numel())
         existing_state = self.request_host_states.get(req_pool_idx)
-        expected_start = 0 if existing_state is None else int(existing_state.stored_upto)
+        expected_start = (
+            0 if existing_state is None else int(existing_state.stored_upto)
+        )
+        if existing_state is not None and not existing_state.resident:
+            return self.stage_request_from_device(
+                req_pool_idx,
+                int(start_pos) + append_len,
+            )
         start_pos = int(start_pos)
         if start_pos < 0:
             raise RuntimeError(
@@ -376,37 +405,71 @@ class RetroInferHiCacheKVStore(RetroInferKVStore):
                 resident=True,
             )
 
-        host_indices = self.host_pool.alloc(append_len)
-        if host_indices is None:
-            raise RuntimeError(
-                f"RetroInfer host KV store is out of capacity for req_pool_idx={req_pool_idx}."
-            )
-        host_indices_for_transfer, device_indices = self._indices_for_transfer(
-            host_indices,
-            device_indices,
-        )
-        self.host_pool.backup_from_device_all_layer(
-            self.device_pool,
-            host_indices=host_indices_for_transfer,
-            device_indices=device_indices,
-            io_backend=self.io_backend,
-        )
-
         old_host_indices = (
             tuple() if existing_state is None else existing_state.host_indices
         )
         old_source_indices = (
             tuple() if existing_state is None else existing_state.source_token_indices
         )
-        new_host_indices = old_host_indices + tuple(
-            int(x) for x in host_indices.tolist()
+        new_stored_upto = expected_start + append_len
+        new_aligned_len = self._aligned_token_capacity(new_stored_upto)
+        old_aligned_len = len(old_host_indices)
+        if old_aligned_len > new_aligned_len:
+            raise RuntimeError(
+                "RetroInfer host KV state has more allocated slots than expected "
+                f"(req_pool_idx={req_pool_idx}, allocated={old_aligned_len}, "
+                f"needed={new_aligned_len})."
+            )
+
+        if new_aligned_len > old_aligned_len:
+            extra_host_indices = self.host_pool.alloc(
+                new_aligned_len - old_aligned_len
+            )
+            if extra_host_indices is None:
+                raise RuntimeError(
+                    "RetroInfer host KV store is out of capacity for "
+                    f"req_pool_idx={req_pool_idx}."
+                )
+            new_host_indices = old_host_indices + tuple(
+                int(x) for x in extra_host_indices.tolist()
+            )
+        else:
+            new_host_indices = old_host_indices
+
+        page_size = max(1, int(self.page_size))
+        transfer_start = (start_pos // page_size) * page_size
+        transfer_end = self._aligned_token_capacity(new_stored_upto)
+        valid_transfer_end = min(transfer_end, new_stored_upto)
+        transfer_device_indices = self._get_request_device_indices(
+            req_pool_idx,
+            valid_transfer_end,
+        )[transfer_start:valid_transfer_end]
+        transfer_device_indices = self._pad_device_indices(
+            transfer_device_indices,
+            transfer_end - transfer_start,
         )
+        host_indices = self._host_indices_for_aligned_range(
+            new_host_indices,
+            start_pos=transfer_start,
+            end_pos=transfer_end,
+        )
+        host_indices_for_transfer, transfer_device_indices = self._indices_for_transfer(
+            host_indices,
+            transfer_device_indices,
+        )
+        self.host_pool.backup_from_device_all_layer(
+            self.device_pool,
+            host_indices=host_indices_for_transfer,
+            device_indices=transfer_device_indices,
+            io_backend=self.io_backend,
+        )
+
         new_source_indices = old_source_indices + tuple(
             int(x) for x in device_indices.tolist()
         )
         request_state = self._build_host_state(
             req_pool_idx=req_pool_idx,
-            stored_upto=expected_start + append_len,
+            stored_upto=new_stored_upto,
             host_indices=new_host_indices,
             source_token_indices=new_source_indices,
             resident=True,

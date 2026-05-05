@@ -474,13 +474,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             kv_indices = tree_cache.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
-            tree_cache.token_to_kv_pool_allocator.free(kv_indices)
+            _free_valid_kv_indices(tree_cache, kv_indices)
 
         if end_p > start_p:
             kv_indices = tree_cache.req_to_token_pool.req_to_token[
                 req.req_pool_idx, start_p:end_p
             ]
-            tree_cache.token_to_kv_pool_allocator.free(kv_indices)
+            _free_valid_kv_indices(tree_cache, kv_indices)
 
         tree_cache.req_to_token_pool.free(req.req_pool_idx)
         if req.last_node is not None:
@@ -488,15 +488,18 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.last_node = None
         req.prefix_indices = []
         req.cache_protected_len = 0
+        _drain_evictable_if_sparse_physical(tree_cache)
         return
 
     if req.last_node is None:
         req.pop_committed_kv_cache()
         req.pop_overallocated_kv_cache()
         tree_cache.req_to_token_pool.free(req.req_pool_idx)
+        _drain_evictable_if_sparse_physical(tree_cache)
         return
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
+    _drain_evictable_if_sparse_physical(tree_cache)
     start_p, end_p = req.pop_overallocated_kv_cache()
 
     page_size = global_server_args.page_size
@@ -516,7 +519,43 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
         start_p:end_p
     ]
-    tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+    _free_valid_kv_indices(tree_cache, indices_to_free)
+    _drain_evictable_if_sparse_physical(tree_cache)
+
+
+def _drain_evictable_if_sparse_physical(tree_cache: BasePrefixCache):
+    allocator = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    if not getattr(allocator, "_sparse_framework_physical_eviction_active", False):
+        return
+    evictable_size = getattr(tree_cache, "evictable_size", None)
+    evict = getattr(tree_cache, "evict", None)
+    if not callable(evictable_size) or not callable(evict):
+        return
+    count = int(evictable_size())
+    if count > 0:
+        evict(count)
+
+
+def _free_valid_kv_indices(tree_cache: BasePrefixCache, kv_indices: torch.Tensor):
+    valid_indices = kv_indices[kv_indices >= 0]
+    sparse_freed_slots = getattr(
+        tree_cache.token_to_kv_pool_allocator,
+        "_sparse_framework_freed_slots",
+        None,
+    )
+    if sparse_freed_slots and valid_indices.numel() > 0:
+        valid_list = [
+            int(x)
+            for x in valid_indices.detach().cpu().tolist()
+            if int(x) not in sparse_freed_slots
+        ]
+        if not valid_list:
+            return
+        valid_indices = torch.tensor(
+            valid_list, dtype=valid_indices.dtype, device=valid_indices.device
+        )
+    if valid_indices.numel() > 0:
+        tree_cache.token_to_kv_pool_allocator.free(valid_indices)
 
 
 def available_and_evictable_str(tree_cache) -> str:
