@@ -150,13 +150,24 @@ def _schedule_sparse_cpu_prefetch(ctx, state: dict) -> dict:
             already_pending += len(positions)
             continue
 
-        keys, values, found_positions, missing_positions = store.get_many(
-            req_pool_idx=req_pool_idx,
-            layer_id=layer_id,
-            positions=positions,
-            device=device,
-            dtype=dtype,
-        )
+        get_many_async = getattr(store, "get_many_async", None)
+        if callable(get_many_async):
+            keys, values, found_positions, missing_positions, h2d_event = get_many_async(
+                req_pool_idx=req_pool_idx,
+                layer_id=layer_id,
+                positions=positions,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            keys, values, found_positions, missing_positions = store.get_many(
+                req_pool_idx=req_pool_idx,
+                layer_id=layer_id,
+                positions=positions,
+                device=device,
+                dtype=dtype,
+            )
+            h2d_event = None
         batch_missing_gpu_unavailable = 0
         if missing_positions:
             missing += len(missing_positions)
@@ -175,6 +186,9 @@ def _schedule_sparse_cpu_prefetch(ctx, state: dict) -> dict:
                 batch_missing_gpu_unavailable += len(positions)
             if batch_missing_gpu_unavailable > 0:
                 continue
+        if missing_positions and h2d_event is not None and keys is not None:
+            torch.cuda.current_stream(device=keys.device).wait_event(h2d_event)
+            h2d_event = None
 
         key_subset, value_subset, prefetch_positions, gpu_snapshot = _merge_cpu_and_gpu_rows(
             ctx,
@@ -201,8 +215,8 @@ def _schedule_sparse_cpu_prefetch(ctx, state: dict) -> dict:
                 values=gpu_snapshot["values"],
             )
 
-        event = None
-        if key_subset.is_cuda:
+        event = h2d_event
+        if event is None and key_subset.is_cuda:
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(device=device))
         pending[prefetch_key] = {

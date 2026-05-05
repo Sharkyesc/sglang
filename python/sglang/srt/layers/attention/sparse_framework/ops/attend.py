@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.layers.attention.sparse_framework.ops.batched_decode_attention import (
     batched_sparse_decode_attention,
+    batched_sparse_decode_attention_with_weights,
     can_use_batched_sparse_decode,
 )
 from sglang.srt.layers.attention.sparse_framework.kv_store import get_cpu_kv_store
@@ -67,10 +68,9 @@ class AttendOp(BaseSparseOp):
         output_view = output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        attention_weights = []
+        attention_weights = [None] * len(selected_kv_indices)
         working_set_stats = []
-        key_subsets = []
-        value_subsets = []
+        records = []
 
         selected_positions = state.get("selected_positions") or []
         for batch_idx, token_indices in enumerate(selected_kv_indices):
@@ -89,26 +89,102 @@ class AttendOp(BaseSparseOp):
                 v_cache=v_cache,
                 state=state,
             )
-            key_subsets.append(key_subset)
-            value_subsets.append(value_subset)
+            h2d_event = ws_stats.pop("_h2d_event", None)
+            records.append(
+                {
+                    "batch_idx": batch_idx,
+                    "key": key_subset,
+                    "value": value_subset,
+                    "event": h2d_event,
+                }
+            )
             working_set_stats.append(ws_stats)
 
         plan = state.get("execution_plan")
         requires_scores = bool(
             getattr(getattr(plan, "selection_plan", None), "requires_scores", False)
         )
-        if (
-            not requires_scores
-            and key_subsets
-            and all(item is not None for item in key_subsets)
-            and can_use_batched_sparse_decode(
+        ready_records = []
+        pending_records = []
+        for record in records:
+            event = record["event"]
+            if event is None:
+                ready_records.append(record)
+                continue
+            query_event = getattr(event, "query", None)
+            if callable(query_event) and query_event():
+                ready_records.append(record)
+            else:
+                pending_records.append(record)
+
+        kernel_names = []
+        if ready_records:
+            kernel_names.append(
+                self._compute_record_group(
+                    ready_records,
+                    q_view=q_view,
+                    output_view=output_view,
+                    attention_weights=attention_weights,
+                    layer=layer,
+                    requires_scores=requires_scores,
+                )
+            )
+        for record in pending_records:
+            event = record["event"]
+            if event is not None:
+                torch.cuda.current_stream(device=q_view.device).wait_event(event)
+        if pending_records:
+            kernel_names.append(
+                self._compute_record_group(
+                    pending_records,
+                    q_view=q_view,
+                    output_view=output_view,
+                    attention_weights=attention_weights,
+                    layer=layer,
+                    requires_scores=requires_scores,
+                )
+            )
+
+        state["subset_attention_kernel"] = "+".join(kernel_names) if kernel_names else "none"
+        state["inter_request_overlap"] = {
+            "ready": len(ready_records),
+            "pending": len(pending_records),
+            "granularity": "request_working_set_h2d",
+        }
+
+        state["attention_output"] = output
+        state["attention_weights"] = [item for item in attention_weights if item is not None]
+        state["working_set_result"] = working_set_stats
+        return output
+
+    def _compute_record_group(
+        self,
+        records: list[dict],
+        *,
+        q_view: torch.Tensor,
+        output_view: torch.Tensor,
+        attention_weights: list,
+        layer,
+        requires_scores: bool,
+    ) -> str:
+        if not records:
+            return "none"
+        key_subsets = [record["key"] for record in records]
+        value_subsets = [record["value"] for record in records]
+        if all(
+            key is not None and value is not None
+            for key, value in zip(key_subsets, value_subsets)
+        ) and all(
+            can_use_batched_sparse_decode(
                 query=q_view,
-                key=key_subsets[0],
-                value=value_subsets[0],
+                key=key,
+                value=value,
                 q_head_num=layer.tp_q_head_num,
                 kv_head_num=layer.tp_k_head_num,
             )
+            for key, value in zip(key_subsets, value_subsets)
         ):
+            batch_indices = [int(record["batch_idx"]) for record in records]
             packed_keys = torch.cat(key_subsets, dim=0)
             packed_values = torch.cat(value_subsets, dim=0)
             lengths = torch.tensor(
@@ -122,9 +198,10 @@ class AttendOp(BaseSparseOp):
                 device=q_view.device,
             )
             packed_indptr[1:] = torch.cumsum(lengths, dim=0)
-            output_view.copy_(
-                batched_sparse_decode_attention(
-                    query=q_view,
+            group_q = q_view[batch_indices]
+            if requires_scores:
+                group_output, packed_weights = batched_sparse_decode_attention_with_weights(
+                    query=group_q,
                     key=packed_keys,
                     value=packed_values,
                     kv_indptr=packed_indptr,
@@ -132,28 +209,42 @@ class AttendOp(BaseSparseOp):
                     q_head_num=layer.tp_q_head_num,
                     kv_head_num=layer.tp_k_head_num,
                 )
-            )
-            state["subset_attention_kernel"] = "triton_batched_sparse_decode"
-        else:
-            for batch_idx, (key_subset, value_subset) in enumerate(
-                zip(key_subsets, value_subsets)
-            ):
-                per_req_out, per_req_weights = self._compute_subset_attention(
-                    q_view[batch_idx : batch_idx + 1],
-                    key_subset,
-                    value_subset,
+                for local_idx, batch_idx in enumerate(batch_indices):
+                    start = int(packed_indptr[local_idx].item())
+                    end = int(packed_indptr[local_idx + 1].item())
+                    attention_weights[batch_idx] = packed_weights[start:end].transpose(
+                        0, 1
+                    )
+            else:
+                group_output = batched_sparse_decode_attention(
+                    query=group_q,
+                    key=packed_keys,
+                    value=packed_values,
+                    kv_indptr=packed_indptr,
                     scaling=layer.scaling,
                     q_head_num=layer.tp_q_head_num,
                     kv_head_num=layer.tp_k_head_num,
                 )
-                output_view[batch_idx : batch_idx + 1] = per_req_out
-                attention_weights.append(per_req_weights)
-            state["subset_attention_kernel"] = "torch_per_request"
+            output_view[batch_indices] = group_output
+            return (
+                "triton_batched_sparse_decode_with_weights"
+                if requires_scores
+                else "triton_batched_sparse_decode"
+            )
 
-        state["attention_output"] = output
-        state["attention_weights"] = attention_weights
-        state["working_set_result"] = working_set_stats
-        return output
+        for record in records:
+            batch_idx = int(record["batch_idx"])
+            per_req_out, per_req_weights = self._compute_subset_attention(
+                q_view[batch_idx : batch_idx + 1],
+                record["key"],
+                record["value"],
+                scaling=layer.scaling,
+                q_head_num=layer.tp_q_head_num,
+                kv_head_num=layer.tp_k_head_num,
+            )
+            output_view[batch_idx : batch_idx + 1] = per_req_out
+            attention_weights[batch_idx] = per_req_weights
+        return "torch_per_request"
 
     def _store_current_decode_kv(self, ctx, layer, key: torch.Tensor, value: torch.Tensor) -> None:
         store = get_cpu_kv_store(ctx.framework_state)
@@ -234,6 +325,7 @@ class AttendOp(BaseSparseOp):
         missing_positions = list(token_positions)
         cpu_missing_gpu_available = 0
         cpu_missing_gpu_unavailable = 0
+        h2d_event = None
         prefetch = self._consume_sparse_cpu_prefetch(
             ctx,
             req_pool_idx=req_pool_idx,
@@ -241,19 +333,35 @@ class AttendOp(BaseSparseOp):
             positions=token_positions,
         )
         if prefetch is not None:
-            cpu_keys, cpu_values, cpu_positions = prefetch
+            cpu_keys, cpu_values, cpu_positions, h2d_event = prefetch
             cpu_position_set = {int(pos) for pos in cpu_positions}
             missing_positions = [
                 int(pos) for pos in token_positions if int(pos) not in cpu_position_set
             ]
         elif store is not None and token_positions:
-            cpu_keys, cpu_values, cpu_positions, missing_positions = store.get_many(
-                req_pool_idx=req_pool_idx,
-                layer_id=int(layer.layer_id),
-                positions=token_positions,
-                device=k_cache.device,
-                dtype=k_cache.dtype,
-            )
+            get_many_async = getattr(store, "get_many_async", None)
+            if callable(get_many_async):
+                (
+                    cpu_keys,
+                    cpu_values,
+                    cpu_positions,
+                    missing_positions,
+                    h2d_event,
+                ) = get_many_async(
+                    req_pool_idx=req_pool_idx,
+                    layer_id=int(layer.layer_id),
+                    positions=token_positions,
+                    device=k_cache.device,
+                    dtype=k_cache.dtype,
+                )
+            else:
+                cpu_keys, cpu_values, cpu_positions, missing_positions = store.get_many(
+                    req_pool_idx=req_pool_idx,
+                    layer_id=int(layer.layer_id),
+                    positions=token_positions,
+                    device=k_cache.device,
+                    dtype=k_cache.dtype,
+                )
 
         if not missing_positions:
             key_subset = cpu_keys
@@ -262,6 +370,7 @@ class AttendOp(BaseSparseOp):
         elif cpu_keys is None or cpu_values is None:
             key_subset = k_cache[token_indices]
             value_subset = v_cache[token_indices]
+            h2d_event = None
             gpu_fallback_count = int(token_indices.numel())
             cpu_missing_gpu_available = int((token_indices >= 0).sum().item())
             cpu_missing_gpu_unavailable = int((token_indices < 0).sum().item())
@@ -303,6 +412,7 @@ class AttendOp(BaseSparseOp):
                     value_parts.append(gpu_values[gpu_lookup[pos]])
             key_subset = torch.stack(key_parts)
             value_subset = torch.stack(value_parts)
+            h2d_event = None
             gpu_fallback_count = int(gpu_keys.shape[0])
             self._snapshot_missing_to_cpu(
                 store,
@@ -335,6 +445,7 @@ class AttendOp(BaseSparseOp):
                 )
                 key_subset = k_cache[token_indices]
                 value_subset = v_cache[token_indices]
+                h2d_event = None
                 gpu_fallback_count = int(token_indices.numel())
                 cpu_positions = []
                 self._snapshot_missing_to_cpu(
@@ -348,7 +459,12 @@ class AttendOp(BaseSparseOp):
                 validation["fallback_reason"] = "cpu_store_mismatch"
                 validation["dropped_request_layers"] = dropped_request_layers
 
-        if buffer is not None and key_subset is not None and value_subset is not None:
+        if (
+            buffer is not None
+            and h2d_event is None
+            and key_subset is not None
+            and value_subset is not None
+        ):
             key_subset, value_subset = buffer.materialize(
                 layer_id=int(layer.layer_id),
                 key=key_subset,
@@ -365,6 +481,8 @@ class AttendOp(BaseSparseOp):
             "buffered": int(key_subset.shape[0]) if key_subset is not None else 0,
             "kv_cache_check": validation,
             "prefetched": prefetch is not None,
+            "h2d_async": h2d_event is not None,
+            "_h2d_event": h2d_event,
         }
 
     def _consume_sparse_cpu_prefetch(
@@ -374,7 +492,7 @@ class AttendOp(BaseSparseOp):
         req_pool_idx: int,
         layer_id: int,
         positions: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor, list[int]] | None:
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.cuda.Event | None] | None:
         if ctx.framework_state is None or not positions:
             return None
         pending = ctx.framework_state.get("sparse_cpu_prefetches") or {}
@@ -382,10 +500,7 @@ class AttendOp(BaseSparseOp):
         item = pending.pop(key, None)
         if item is None:
             return None
-        event = item.get("event")
-        if event is not None:
-            torch.cuda.current_stream(device=item["keys"].device).wait_event(event)
-        return item["keys"], item["values"], item["positions"]
+        return item["keys"], item["values"], item["positions"], item.get("event")
 
     def _snapshot_missing_to_cpu(
         self,

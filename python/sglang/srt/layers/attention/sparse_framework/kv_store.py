@@ -129,6 +129,7 @@ class SparseCPUKVStore:
     def __init__(self):
         self.layers: dict[tuple[int, int], RequestLayerKV] = {}
         self.copy_streams: dict[torch.device, torch.cuda.Stream] = {}
+        self.h2d_streams: dict[torch.device, torch.cuda.Stream] = {}
 
     def drop_request(self, req_pool_idx: int) -> int:
         req_pool_idx = int(req_pool_idx)
@@ -215,6 +216,58 @@ class SparseCPUKVStore:
             missing_positions,
         )
 
+    def get_many_async(
+        self,
+        *,
+        req_pool_idx: int,
+        layer_id: int,
+        positions: list[int],
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        list[int],
+        list[int],
+        torch.cuda.Event | None,
+    ]:
+        entry = self.layers.get((int(req_pool_idx), int(layer_id)))
+        if entry is None or entry.key_buffer is None or entry.value_buffer is None:
+            return None, None, [], [int(pos) for pos in positions], None
+
+        offsets, found_positions, missing_positions = entry.get_offsets(
+            [int(pos) for pos in positions]
+        )
+        if not offsets:
+            return None, None, found_positions, missing_positions, None
+        for position in found_positions:
+            entry.wait_position(position)
+
+        target_device = torch.device(device)
+        if target_device.type != "cuda" or not entry.pinned or not torch.cuda.is_available():
+            keys, values, found_positions, missing_positions = self.get_many(
+                req_pool_idx=req_pool_idx,
+                layer_id=layer_id,
+                positions=positions,
+                device=device,
+                dtype=dtype,
+            )
+            return keys, values, found_positions, missing_positions, None
+
+        offset_tensor = torch.tensor(offsets, dtype=torch.long)
+        key_rows = entry.key_buffer.index_select(0, offset_tensor)
+        value_rows = entry.value_buffer.index_select(0, offset_tensor)
+        stream = self._h2d_stream_for(target_device)
+        assert stream is not None
+        with torch.cuda.stream(stream):
+            key_out = key_rows.to(device=target_device, dtype=dtype, non_blocking=True)
+            value_out = value_rows.to(device=target_device, dtype=dtype, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(stream)
+            key_out.record_stream(stream)
+            value_out.record_stream(stream)
+        return key_out, value_out, found_positions, missing_positions, event
+
     def build_chunk_index(
         self,
         *,
@@ -291,6 +344,15 @@ class SparseCPUKVStore:
         if stream is None:
             stream = torch.cuda.Stream(device=device)
             self.copy_streams[device] = stream
+        return stream
+
+    def _h2d_stream_for(self, device: torch.device) -> torch.cuda.Stream | None:
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        stream = self.h2d_streams.get(device)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self.h2d_streams[device] = stream
         return stream
 
 
