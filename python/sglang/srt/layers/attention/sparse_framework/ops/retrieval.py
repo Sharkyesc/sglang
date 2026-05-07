@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.sparse_framework.selection_spec import (
 class RetrievalSelector:
     def __init__(self):
         self.last_stats: dict = {}
+        self.last_priority: dict[int, float] = {}
 
     def select_positions(
         self,
@@ -29,6 +30,7 @@ class RetrievalSelector:
         seq_len: int,
     ) -> list[int]:
         self.last_stats = {}
+        self.last_priority = {}
         if spec.name or spec.import_path or spec.fn:
             positions = self._callback_positions(
                 spec,
@@ -96,7 +98,17 @@ class RetrievalSelector:
             )
         except TypeError:
             value = callback(ctx, request_view, layer_id)
-        return SelectionResult.from_callback_output(value).to_positions(seq_len)
+        result = SelectionResult.from_callback_output(value)
+        positions = result.to_positions(seq_len)
+        if result.priority:
+            self.last_priority = {
+                int(pos): float(priority)
+                for pos, priority in result.priority.items()
+                if 0 <= int(pos) < seq_len
+            }
+        else:
+            self.last_priority = self._rank_priority(positions)
+        return positions
 
     def _similarity_positions(
         self,
@@ -121,6 +133,7 @@ class RetrievalSelector:
         middle_end = max(middle_start, seq_len - suffix_len)
         if middle_end <= middle_start:
             positions = sorted(selected)
+            self.last_priority = self._rank_priority(positions)
             self._set_stats(
                 prefix_len=prefix_len,
                 suffix_len=suffix_len,
@@ -140,6 +153,7 @@ class RetrievalSelector:
         )
         if candidate_positions.numel() == 0:
             positions = sorted(selected)
+            self.last_priority = self._rank_priority(positions)
             self._set_stats(
                 prefix_len=prefix_len,
                 suffix_len=suffix_len,
@@ -174,6 +188,7 @@ class RetrievalSelector:
         candidate_keys = key_cache[candidate_kv_indices]
         if candidate_keys.numel() == 0:
             positions = sorted(selected)
+            self.last_priority = self._rank_priority(positions)
             self._set_stats(
                 prefix_len=prefix_len,
                 suffix_len=suffix_len,
@@ -196,6 +211,7 @@ class RetrievalSelector:
         k = min(retrieval_budget, int(scores.numel()))
         if k <= 0:
             positions = sorted(selected)
+            self.last_priority = self._rank_priority(positions)
             self._set_stats(
                 prefix_len=prefix_len,
                 suffix_len=suffix_len,
@@ -219,6 +235,7 @@ class RetrievalSelector:
         )
         selected.update(retrieval_positions)
         positions = sorted(selected)
+        self.last_priority = self._rank_priority(retrieval_positions)
         self._set_stats(
             prefix_len=prefix_len,
             suffix_len=suffix_len,
@@ -287,6 +304,7 @@ class RetrievalSelector:
 
         selected.update(retrieval_positions)
         positions = sorted(selected)
+        self.last_priority = self._rank_priority(retrieval_positions)
         self._set_stats(
             prefix_len=prefix_len,
             suffix_len=suffix_len,
@@ -327,6 +345,7 @@ class RetrievalSelector:
         middle_len = max(0, middle_end - middle_start)
         if middle_len == 0:
             positions = sorted(selected)
+            self.last_priority = self._rank_priority(positions)
             self._set_stats(
                 prefix_len=prefix_len,
                 suffix_len=suffix_len,
@@ -354,6 +373,7 @@ class RetrievalSelector:
                 selected.add(pos)
             pos += 1
         positions = sorted(selected)
+        self.last_priority = self._rank_priority(retrieval_positions)
         self._set_stats(
             prefix_len=prefix_len,
             suffix_len=suffix_len,
@@ -419,6 +439,12 @@ class RetrievalSelector:
                 if len(ordered) >= limit:
                     return ordered
         return ordered
+
+    def _rank_priority(self, positions: list[int]) -> dict[int, float]:
+        count = len(positions)
+        if count <= 0:
+            return {}
+        return {int(pos): float(count - rank) for rank, pos in enumerate(positions)}
 
     def _set_stats(
         self,

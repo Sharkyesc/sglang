@@ -67,6 +67,27 @@ class HeavyHitterStateManager:
         score_delta = attn_weights.sum(dim=0).to(layer_state.scores.dtype)
         layer_state.scores[selected_positions] += score_delta
 
+    def position_scores(
+        self,
+        *,
+        req_pool_idx: int,
+        layer_id: int,
+        positions: list[int],
+    ) -> dict[int, float]:
+        request_state = self.request_states.get(req_pool_idx)
+        if request_state is None:
+            return {}
+        layer_state = request_state.layer_states.get(layer_id)
+        if layer_state is None or not positions:
+            return {}
+        scores = layer_state.scores.detach()
+        result = {}
+        for pos in positions:
+            pos = int(pos)
+            if 0 <= pos < int(scores.numel()):
+                result[pos] = float(scores[pos].item())
+        return result
+
     def _ensure_layer_state(
         self,
         request_state: HeavyHitterRequestState,

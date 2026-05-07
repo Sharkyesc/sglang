@@ -21,6 +21,8 @@ class KVResidencyEntry:
     version: int = 0
     last_access_step: int = 0
     access_count: int = 0
+    selection_priority: float = 0.0
+    last_selected_step: int = 0
 
     @property
     def logical_evicted(self) -> bool:
@@ -186,13 +188,39 @@ class KVResidencyTable:
     def eviction_candidates(
         self,
         active_keys: set[tuple[int, int, int]],
+        cache_policy: str = "working_set",
     ) -> list[KVResidencyEntry]:
         candidates = [
             entry
             for key, entry in self.entries.items()
             if key not in active_keys and entry.state == "gpu" and entry.device_index is not None
         ]
-        candidates.sort(key=lambda entry: (entry.last_access_step, entry.access_count))
+        cache_policy = (cache_policy or "working_set").lower()
+        if cache_policy == "recent":
+            candidates.sort(
+                key=lambda entry: (
+                    entry.position,
+                    entry.last_access_step,
+                    entry.access_count,
+                )
+            )
+        elif cache_policy == "priority":
+            candidates.sort(
+                key=lambda entry: (
+                    entry.selection_priority,
+                    entry.last_access_step,
+                    entry.access_count,
+                )
+            )
+        else:
+            candidates.sort(
+                key=lambda entry: (
+                    entry.last_selected_step,
+                    entry.selection_priority,
+                    entry.last_access_step,
+                    entry.access_count,
+                )
+            )
         return candidates
 
 

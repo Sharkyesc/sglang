@@ -28,6 +28,7 @@ class SelectOp(BaseSparseOp):
         plan = state["execution_plan"].selection_plan
         selected_positions = []
         selected_kv_indices = []
+        selection_importance = []
         selection_contributions = []
         req_to_token = ctx.req_to_token_pool.req_to_token
 
@@ -44,6 +45,7 @@ class SelectOp(BaseSparseOp):
             selection_contributions.append(
                 getattr(self, "_last_contribution_stats", {})
             )
+            selection_importance.append(getattr(self, "_last_selection_importance", {}))
             position_tensor = torch.tensor(
                 positions, dtype=torch.long, device=ctx.seq_lens.device
             )
@@ -79,6 +81,7 @@ class SelectOp(BaseSparseOp):
         state["selected_kv_indices"] = selected_kv_indices
         state["kv_indptr"] = kv_indptr
         state["kv_indices"] = kv_indices
+        state["selection_importance"] = selection_importance
         state["selection_contributions"] = selection_contributions
         return selected_positions
 
@@ -105,28 +108,40 @@ class SelectOp(BaseSparseOp):
             "retrieval_method": None,
             "final": 0,
         }
+        importance_by_position = {}
         for spec in specs:
             if isinstance(spec, FixedSelectionSpec):
                 positions = self._fixed_positions(spec, seq_len)
                 per_spec_positions.append(positions)
+                self._merge_importance(
+                    importance_by_position,
+                    {pos: 1.0 for pos in positions},
+                )
                 contribution_stats["fixed"] += len(set(positions))
             elif isinstance(spec, SlidingWindowSelectionSpec):
                 window = max(0, int(spec.window_size))
                 start = max(0, seq_len - window)
                 positions = list(range(start, seq_len))
                 per_spec_positions.append(positions)
+                self._merge_importance(
+                    importance_by_position,
+                    {
+                        pos: float(pos - start + 1)
+                        for pos in positions
+                    },
+                )
                 contribution_stats["window"] += len(set(positions))
             elif isinstance(spec, HeavyHitterSelectionSpec):
-                per_spec_positions.append(
-                    self._heavy_hitter_positions(
-                        spec,
-                        ctx,
-                        req_pool_idx=req_pool_idx,
-                        seq_len=seq_len,
-                    )
+                positions, priority = self._heavy_hitter_positions(
+                    spec,
+                    ctx,
+                    req_pool_idx=req_pool_idx,
+                    seq_len=seq_len,
                 )
+                per_spec_positions.append(positions)
+                self._merge_importance(importance_by_position, priority)
             elif isinstance(spec, RetrievalSelectionSpec):
-                positions, stats = self._retrieval_positions(
+                positions, stats, priority = self._retrieval_positions(
                     spec,
                     ctx,
                     request_index=request_index,
@@ -134,6 +149,7 @@ class SelectOp(BaseSparseOp):
                     seq_len=seq_len,
                 )
                 per_spec_positions.append(positions)
+                self._merge_importance(importance_by_position, priority)
                 contribution_stats["prefix"] += int(stats.get("prefix", 0))
                 contribution_stats["suffix"] += int(stats.get("suffix", 0))
                 contribution_stats["retrieval"] += int(stats.get("retrieval", 0))
@@ -142,19 +158,32 @@ class SelectOp(BaseSparseOp):
                 contribution_stats["retrieval_middle"] += int(stats.get("middle", 0))
                 contribution_stats["retrieval_method"] = stats.get("method")
             elif isinstance(spec, CustomSelectionSpec):
-                per_spec_positions.append(
-                    self._custom_positions(
-                        spec,
-                        ctx,
-                        request_index=request_index,
-                        req_pool_idx=req_pool_idx,
-                        seq_len=seq_len,
-                    )
+                positions, priority = self._custom_positions(
+                    spec,
+                    ctx,
+                    request_index=request_index,
+                    req_pool_idx=req_pool_idx,
+                    seq_len=seq_len,
                 )
+                per_spec_positions.append(positions)
+                self._merge_importance(importance_by_position, priority)
         positions = self._combine_positions(per_spec_positions, combine, seq_len)
         contribution_stats["final"] = len(positions)
         self._last_contribution_stats = contribution_stats
+        self._last_selection_importance = {
+            int(pos): float(importance_by_position.get(int(pos), 0.0))
+            for pos in positions
+        }
         return positions
+
+    def _merge_importance(
+        self,
+        target: dict[int, float],
+        source: dict[int, float],
+    ) -> None:
+        for pos, priority in source.items():
+            pos = int(pos)
+            target[pos] = max(float(priority), target.get(pos, 0.0))
 
     def _combine_positions(
         self,
@@ -212,7 +241,7 @@ class SelectOp(BaseSparseOp):
         request_index: int,
         req_pool_idx: int,
         seq_len: int,
-    ) -> list[int]:
+    ) -> tuple[list[int], dict[int, float]]:
         callback = SelectionCallbackRegistry.resolve(spec)
         layer_id = getattr(ctx.layer, "layer_id", None)
         request_view = RequestSelectionView(
@@ -235,7 +264,15 @@ class SelectOp(BaseSparseOp):
         except TypeError:
             value = callback(ctx, request_view, layer_id)
         result = SelectionResult.from_callback_output(value)
-        return result.to_positions(seq_len)
+        positions = result.to_positions(seq_len)
+        priority = {}
+        if result.priority:
+            priority = {
+                int(pos): float(value)
+                for pos, value in result.priority.items()
+                if 0 <= int(pos) < seq_len
+            }
+        return positions, priority
 
     def _heavy_hitter_positions(
         self,
@@ -244,11 +281,11 @@ class SelectOp(BaseSparseOp):
         *,
         req_pool_idx: int,
         seq_len: int,
-    ) -> list[int]:
+    ) -> tuple[list[int], dict[int, float]]:
         layer_id = getattr(ctx.layer, "layer_id", None)
         framework_state = ctx.framework_state
         if layer_id is None or framework_state is None:
-            return []
+            return [], {}
         manager = framework_state.get("heavy_hitter_manager")
         if manager is None:
             manager = HeavyHitterStateManager()
@@ -261,7 +298,13 @@ class SelectOp(BaseSparseOp):
             seq_len=seq_len,
             device=ctx.seq_lens.device,
         )
-        return positions.detach().cpu().tolist()
+        positions_list = positions.detach().cpu().tolist()
+        priority = manager.position_scores(
+            req_pool_idx=req_pool_idx,
+            layer_id=layer_id,
+            positions=positions_list,
+        )
+        return positions_list, priority
 
     def _retrieval_positions(
         self,
@@ -271,7 +314,7 @@ class SelectOp(BaseSparseOp):
         request_index: int,
         req_pool_idx: int,
         seq_len: int,
-    ) -> tuple[list[int], dict]:
+    ) -> tuple[list[int], dict, dict[int, float]]:
         framework_state = ctx.framework_state
         if framework_state is None:
             selector = RetrievalSelector()
@@ -287,4 +330,8 @@ class SelectOp(BaseSparseOp):
             req_pool_idx=req_pool_idx,
             seq_len=seq_len,
         )
-        return positions, dict(getattr(selector, "last_stats", {}))
+        return (
+            positions,
+            dict(getattr(selector, "last_stats", {})),
+            dict(getattr(selector, "last_priority", {})),
+        )

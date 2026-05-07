@@ -12,8 +12,10 @@ from sglang.srt.layers.attention.sparse_framework.residency import (
 
 class CacheOp(BaseSparseOp):
     def run(self, ctx, state: dict):
+        plan = state.get("execution_plan")
         selected_positions = state.get("selected_positions") or []
         selected_kv_indices = state.get("selected_kv_indices") or []
+        selection_importance = state.get("selection_importance") or []
         layer_id = getattr(ctx.layer, "layer_id", None)
         if layer_id is None or ctx.framework_state is None:
             state["cache_result"] = {"enabled": False, "reason": "missing_layer_or_state"}
@@ -34,8 +36,14 @@ class CacheOp(BaseSparseOp):
                 continue
             positions = selected_positions[batch_idx].detach().cpu().tolist()
             kv_indices = selected_kv_indices[batch_idx].detach().cpu().tolist()
+            importance_by_position = (
+                selection_importance[batch_idx]
+                if batch_idx < len(selection_importance)
+                else {}
+            )
             for pos, device_index in zip(positions, kv_indices):
                 key = (req_pool_idx, layer_id, int(pos))
+                importance = float(importance_by_position.get(int(pos), 0.0))
                 active_keys.add(key)
                 batch_keys.append(key)
                 if int(device_index) < 0:
@@ -53,6 +61,8 @@ class CacheOp(BaseSparseOp):
                     else:
                         entry.last_access_step = step
                         entry.access_count += 1
+                    entry.selection_priority = importance
+                    entry.last_selected_step = step
                     is_miss = True
                 else:
                     tracker.mark_reused(req_pool_idx, int(pos))
@@ -63,13 +73,19 @@ class CacheOp(BaseSparseOp):
                         device_index=int(device_index),
                         step=step,
                     )
+                    entry.selection_priority = importance
+                    entry.last_selected_step = step
                 if is_miss:
                     misses.append(entry)
                 else:
                     hits.append(entry)
             selected_cache_keys.append(batch_keys)
 
-        eviction_candidates = table.eviction_candidates(active_keys)
+        cache_policy = getattr(plan, "cache_policy", "working_set")
+        eviction_candidates = table.eviction_candidates(
+            active_keys,
+            cache_policy=cache_policy,
+        )
 
         state["cache_hits"] = hits
         state["cache_misses"] = misses
@@ -83,5 +99,6 @@ class CacheOp(BaseSparseOp):
             "entries": len(table.entries),
             "live_gpu": table.live_gpu_count(),
             "live_gpu_tokens": table.live_gpu_token_count(),
+            "cache_policy": cache_policy,
         }
         return None
