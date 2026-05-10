@@ -11,6 +11,10 @@ from sglang.srt.layers.attention.sparse_framework.ops.batched_decode_attention i
 )
 from sglang.srt.layers.attention.sparse_framework.kv_store import get_cpu_kv_store
 from sglang.srt.layers.attention.sparse_framework.ops.base import BaseSparseOp
+from sglang.srt.layers.attention.sparse_framework.ops.utils import (
+    configure_cpu_kv_store_from_state,
+    cpu_kv_store_enabled,
+)
 from sglang.srt.layers.attention.sparse_framework.working_set import (
     get_working_set_buffer,
 )
@@ -56,7 +60,7 @@ class AttendOp(BaseSparseOp):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
-            self._store_current_decode_kv(ctx, layer, k, v)
+            self._store_current_decode_kv(ctx, layer, k, v, state)
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         if layer.qk_head_dim != layer.v_head_dim:
@@ -111,8 +115,7 @@ class AttendOp(BaseSparseOp):
             if event is None:
                 ready_records.append(record)
                 continue
-            query_event = getattr(event, "query", None)
-            if callable(query_event) and query_event():
+            if self._event_ready(event):
                 ready_records.append(record)
             else:
                 pending_records.append(record)
@@ -132,7 +135,7 @@ class AttendOp(BaseSparseOp):
         for record in pending_records:
             event = record["event"]
             if event is not None:
-                torch.cuda.current_stream(device=q_view.device).wait_event(event)
+                self._wait_event(event, device=q_view.device)
         if pending_records:
             kernel_names.append(
                 self._compute_record_group(
@@ -246,10 +249,15 @@ class AttendOp(BaseSparseOp):
             attention_weights[batch_idx] = per_req_weights
         return "torch_per_request"
 
-    def _store_current_decode_kv(self, ctx, layer, key: torch.Tensor, value: torch.Tensor) -> None:
+    def _store_current_decode_kv(
+        self, ctx, layer, key: torch.Tensor, value: torch.Tensor, state: dict
+    ) -> None:
+        if not cpu_kv_store_enabled(state):
+            return
         store = get_cpu_kv_store(ctx.framework_state)
         if store is None:
             return
+        configure_cpu_kv_store_from_state(store, state)
         out_cache_loc = getattr(ctx.forward_batch, "out_cache_loc", None)
         if out_cache_loc is None:
             return
@@ -315,75 +323,139 @@ class AttendOp(BaseSparseOp):
         v_cache: torch.Tensor,
         state: dict,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
-        store = get_cpu_kv_store(ctx.framework_state)
+        store = (
+            get_cpu_kv_store(ctx.framework_state)
+            if cpu_kv_store_enabled(state)
+            else None
+        )
+        configure_cpu_kv_store_from_state(store, state)
         buffer = get_working_set_buffer(ctx.framework_state)
         req_pool_idx = int(ctx.req_pool_indices_cpu[batch_idx])
+        plan = state.get("execution_plan")
+        chunk_selection = state.get("chunk_selection") or {}
+        unit_size = (
+            int(chunk_selection.get("chunk_size", 16))
+            if (
+                bool(chunk_selection.get("enabled"))
+                and bool(getattr(plan, "use_chunked_working_set", False))
+            )
+            else 1
+        )
+        use_delta = buffer is not None and bool(token_positions)
+        delta_plan = None
+        fetch_positions = list(token_positions)
+        fetch_token_indices = token_indices
+        if use_delta:
+            delta_plan = buffer.plan_delta(
+                req_pool_idx=req_pool_idx,
+                layer_id=int(layer.layer_id),
+                positions=token_positions,
+                unit_size=unit_size,
+                device=k_cache.device,
+                dtype=k_cache.dtype,
+                key_shape_tail=tuple(k_cache.shape[1:]),
+                max_position=int(ctx.seq_lens_cpu[batch_idx]),
+                full_miss_units=unit_size > 1,
+            )
+            fetch_positions = list(delta_plan["miss_positions"])
+            if fetch_positions:
+                fetch_position_tensor = torch.tensor(
+                    fetch_positions, dtype=torch.long, device=token_indices.device
+                )
+                fetch_token_indices = ctx.req_to_token_pool.req_to_token[
+                    req_pool_idx, fetch_position_tensor
+                ].to(torch.long)
+            else:
+                fetch_token_indices = token_indices[:0]
 
         cpu_keys = None
         cpu_values = None
         cpu_positions = []
-        missing_positions = list(token_positions)
+        missing_positions = list(fetch_positions)
         cpu_missing_gpu_available = 0
         cpu_missing_gpu_unavailable = 0
         h2d_event = None
+        chunk_fetch_stats = None
         prefetch = self._consume_sparse_cpu_prefetch(
             ctx,
             req_pool_idx=req_pool_idx,
             layer_id=int(layer.layer_id),
-            positions=token_positions,
+            positions=fetch_positions,
         )
         if prefetch is not None:
             cpu_keys, cpu_values, cpu_positions, h2d_event = prefetch
             cpu_position_set = {int(pos) for pos in cpu_positions}
             missing_positions = [
-                int(pos) for pos in token_positions if int(pos) not in cpu_position_set
+                int(pos) for pos in fetch_positions if int(pos) not in cpu_position_set
             ]
-        elif store is not None and token_positions:
-            get_many_async = getattr(store, "get_many_async", None)
-            if callable(get_many_async):
+        elif store is not None and fetch_positions:
+            get_many_chunked_async = getattr(store, "get_many_chunked_async", None)
+            if (
+                unit_size > 1
+                and bool(chunk_selection.get("enabled"))
+                and callable(get_many_chunked_async)
+            ):
                 (
                     cpu_keys,
                     cpu_values,
                     cpu_positions,
                     missing_positions,
                     h2d_event,
-                ) = get_many_async(
+                    chunk_fetch_stats,
+                ) = get_many_chunked_async(
                     req_pool_idx=req_pool_idx,
                     layer_id=int(layer.layer_id),
-                    positions=token_positions,
+                    positions=fetch_positions,
                     device=k_cache.device,
                     dtype=k_cache.dtype,
                 )
             else:
-                cpu_keys, cpu_values, cpu_positions, missing_positions = store.get_many(
-                    req_pool_idx=req_pool_idx,
-                    layer_id=int(layer.layer_id),
-                    positions=token_positions,
-                    device=k_cache.device,
-                    dtype=k_cache.dtype,
-                )
-
+                get_many_async = getattr(store, "get_many_async", None)
+                if callable(get_many_async):
+                    (
+                        cpu_keys,
+                        cpu_values,
+                        cpu_positions,
+                        missing_positions,
+                        h2d_event,
+                    ) = get_many_async(
+                        req_pool_idx=req_pool_idx,
+                        layer_id=int(layer.layer_id),
+                        positions=fetch_positions,
+                        device=k_cache.device,
+                        dtype=k_cache.dtype,
+                    )
+                else:
+                    cpu_keys, cpu_values, cpu_positions, missing_positions = store.get_many(
+                        req_pool_idx=req_pool_idx,
+                        layer_id=int(layer.layer_id),
+                        positions=fetch_positions,
+                        device=k_cache.device,
+                        dtype=k_cache.dtype,
+                    )
+        elif use_delta and not fetch_positions:
+            missing_positions = []
         if not missing_positions:
             key_subset = cpu_keys
             value_subset = cpu_values
             gpu_fallback_count = 0
         elif cpu_keys is None or cpu_values is None:
-            key_subset = k_cache[token_indices]
-            value_subset = v_cache[token_indices]
+            key_subset = k_cache[fetch_token_indices]
+            value_subset = v_cache[fetch_token_indices]
             h2d_event = None
-            gpu_fallback_count = int(token_indices.numel())
-            cpu_missing_gpu_available = int((token_indices >= 0).sum().item())
-            cpu_missing_gpu_unavailable = int((token_indices < 0).sum().item())
+            gpu_fallback_count = int(fetch_token_indices.numel())
+            cpu_missing_gpu_available = int((fetch_token_indices >= 0).sum().item())
+            cpu_missing_gpu_unavailable = int((fetch_token_indices < 0).sum().item())
             self._snapshot_missing_to_cpu(
                 store,
                 req_pool_idx=req_pool_idx,
                 layer_id=int(layer.layer_id),
-                positions=token_positions,
+                positions=fetch_positions,
                 keys=key_subset,
                 values=value_subset,
             )
         else:
-            position_to_index = {int(pos): i for i, pos in enumerate(token_positions)}
+            position_to_index = {int(pos): i for i, pos in enumerate(fetch_positions)}
             missing_offsets = [
                 position_to_index[pos]
                 for pos in missing_positions
@@ -394,7 +466,7 @@ class AttendOp(BaseSparseOp):
                 dtype=torch.long,
                 device=token_indices.device,
             )
-            missing_token_indices = token_indices[missing_index_tensor]
+            missing_token_indices = fetch_token_indices[missing_index_tensor]
             cpu_missing_gpu_available = int((missing_token_indices >= 0).sum().item())
             cpu_missing_gpu_unavailable = int((missing_token_indices < 0).sum().item())
             gpu_keys = k_cache[missing_token_indices]
@@ -403,7 +475,7 @@ class AttendOp(BaseSparseOp):
             value_parts = []
             cpu_lookup = {pos: i for i, pos in enumerate(cpu_positions)}
             gpu_lookup = {pos: i for i, pos in enumerate(missing_positions)}
-            for pos in token_positions:
+            for pos in fetch_positions:
                 if pos in cpu_lookup:
                     key_parts.append(cpu_keys[cpu_lookup[pos]])
                     value_parts.append(cpu_values[cpu_lookup[pos]])
@@ -428,6 +500,7 @@ class AttendOp(BaseSparseOp):
         if (
             key_subset is not None
             and value_subset is not None
+            and not use_delta
             and bool(getattr(plan, "validate_kv_cache", False))
         ):
             validation = self._validate_against_gpu_cache(
@@ -459,17 +532,75 @@ class AttendOp(BaseSparseOp):
                 validation["fallback_reason"] = "cpu_store_mismatch"
                 validation["dropped_request_layers"] = dropped_request_layers
 
+        if buffer is not None and h2d_event is None:
+            if use_delta:
+                materialized_positions = (
+                    fetch_positions
+                    if key_subset is not None and value_subset is not None
+                    else []
+                )
+                key_subset, value_subset, delta_stats = (
+                    buffer.materialize_delta_from_partial(
+                        req_pool_idx=req_pool_idx,
+                        layer_id=int(layer.layer_id),
+                        positions=token_positions,
+                        materialized_positions=materialized_positions,
+                        key=key_subset,
+                        value=value_subset,
+                        unit_size=unit_size,
+                        device=k_cache.device,
+                        key_dtype=k_cache.dtype,
+                        value_dtype=v_cache.dtype,
+                        key_shape_tail=tuple(k_cache.shape[1:]),
+                        value_shape_tail=tuple(v_cache.shape[1:]),
+                    )
+                )
+            elif key_subset is not None and value_subset is not None:
+                key_subset, value_subset = buffer.materialize(
+                    layer_id=int(layer.layer_id),
+                    key=key_subset,
+                    value=value_subset,
+                )
+                delta_stats = {"enabled": False, "layout": "token"}
+            else:
+                delta_stats = {"enabled": False, "reason": "missing_tensor"}
+        else:
+            delta_stats = {"enabled": False, "reason": "pending_or_missing_tensor"}
+
         if (
-            buffer is not None
-            and h2d_event is None
+            use_delta
             and key_subset is not None
             and value_subset is not None
+            and bool(getattr(plan, "validate_kv_cache", False))
         ):
-            key_subset, value_subset = buffer.materialize(
-                layer_id=int(layer.layer_id),
-                key=key_subset,
-                value=value_subset,
+            validation = self._validate_against_gpu_cache(
+                token_indices=token_indices,
+                key_subset=key_subset,
+                value_subset=value_subset,
+                k_cache=k_cache,
+                v_cache=v_cache,
             )
+            if self._kv_cache_check_failed(validation):
+                key_subset = k_cache[token_indices]
+                value_subset = v_cache[token_indices]
+                h2d_event = None
+                gpu_fallback_count = int(token_indices.numel())
+                cpu_positions = []
+                self._snapshot_missing_to_cpu(
+                    store,
+                    req_pool_idx=req_pool_idx,
+                    layer_id=int(layer.layer_id),
+                    positions=token_positions,
+                    keys=key_subset,
+                    values=value_subset,
+                )
+                key_subset, value_subset = buffer.materialize(
+                    layer_id=int(layer.layer_id),
+                    key=key_subset,
+                    value=value_subset,
+                )
+                validation["fallback_reason"] = "chunked_working_set_mismatch"
+                delta_stats = {"enabled": False, "layout": "token_fallback"}
 
         return key_subset, value_subset, {
             "requested": len(token_positions),
@@ -482,6 +613,8 @@ class AttendOp(BaseSparseOp):
             "kv_cache_check": validation,
             "prefetched": prefetch is not None,
             "h2d_async": h2d_event is not None,
+            "chunk_fetch": chunk_fetch_stats,
+            "working_set_delta": delta_stats,
             "_h2d_event": h2d_event,
         }
 
@@ -499,8 +632,69 @@ class AttendOp(BaseSparseOp):
         key = (int(req_pool_idx), int(layer_id), tuple(int(pos) for pos in positions))
         item = pending.pop(key, None)
         if item is None:
-            return None
+            return self._consume_sparse_cpu_position_prefetch(
+                pending,
+                req_pool_idx=req_pool_idx,
+                layer_id=layer_id,
+                positions=positions,
+            )
         return item["keys"], item["values"], item["positions"], item.get("event")
+
+    def _consume_sparse_cpu_position_prefetch(
+        self,
+        pending: dict,
+        *,
+        req_pool_idx: int,
+        layer_id: int,
+        positions: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], object] | None:
+        key_parts = []
+        value_parts = []
+        consumed_positions = []
+        events = []
+        for pos in positions:
+            item = pending.pop((int(req_pool_idx), int(layer_id), int(pos)), None)
+            if item is None:
+                continue
+            keys = item["keys"]
+            values = item["values"]
+            if keys is None or values is None or int(keys.shape[0]) == 0:
+                continue
+            key_parts.append(keys[0])
+            value_parts.append(values[0])
+            consumed_positions.append(int(pos))
+            event = item.get("event")
+            if event is not None:
+                events.append(event)
+        if not key_parts:
+            return None
+        event = None
+        if events:
+            event = events[0] if all(item is events[0] for item in events) else events
+        return (
+            torch.stack(key_parts),
+            torch.stack(value_parts),
+            consumed_positions,
+            event,
+        )
+
+    def _event_ready(self, event) -> bool:
+        if event is None:
+            return True
+        if isinstance(event, (list, tuple)):
+            return all(self._event_ready(item) for item in event)
+        query_event = getattr(event, "query", None)
+        return bool(query_event()) if callable(query_event) else False
+
+    def _wait_event(self, event, *, device) -> None:
+        if event is None:
+            return
+        stream = torch.cuda.current_stream(device=device)
+        if isinstance(event, (list, tuple)):
+            for item in event:
+                self._wait_event(item, device=device)
+            return
+        stream.wait_event(event)
 
     def _snapshot_missing_to_cpu(
         self,

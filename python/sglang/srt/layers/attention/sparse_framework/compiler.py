@@ -8,12 +8,16 @@ from sglang.srt.layers.attention.sparse_framework.ops.cache import CacheOp
 from sglang.srt.layers.attention.sparse_framework.ops.evict import EvictOp
 from sglang.srt.layers.attention.sparse_framework.ops.fallback import FallbackOp
 from sglang.srt.layers.attention.sparse_framework.ops.fetch import FetchOp
+from sglang.srt.layers.attention.sparse_framework.ops.lookahead_prefetch import (
+    LookaheadPrefetchOp,
+)
 from sglang.srt.layers.attention.sparse_framework.ops.remap import RemapOp
 from sglang.srt.layers.attention.sparse_framework.ops.score import ScoreUpdateOp
 from sglang.srt.layers.attention.sparse_framework.ops.select import SelectOp
 from sglang.srt.layers.attention.sparse_framework.plans import ExecutionPlan
 from sglang.srt.layers.attention.sparse_framework.selection_plan import SelectionPlan
 from sglang.srt.layers.attention.sparse_framework.selection_spec import (
+    FixedSelectionSpec,
     FullSelectionSpec,
     HeavyHitterSelectionSpec,
     RetrievalSelectionSpec,
@@ -50,8 +54,10 @@ class PlanCompiler:
             enable_host_backup_on_evict=self.config.enable_host_backup_on_evict,
             enable_physical_eviction=self.config.enable_physical_eviction,
             validate_kv_cache=self.config.validate_kv_cache,
+            chunk_size=self.config.chunk_size,
         )
         self._infer_strategy(execution_plan)
+        self._infer_working_set_layout(execution_plan)
 
         if selection_plan.is_full:
             execution_plan.ops = [AttendOp(mode="dense")]
@@ -64,6 +70,7 @@ class PlanCompiler:
                     RemapOp(),
                     AttendOp(mode="subset_decode"),
                     ScoreUpdateOp(),
+                    LookaheadPrefetchOp(),
                     EvictOp(),
                     FallbackOp(reason="subset_decode_unavailable"),
                 ]
@@ -106,6 +113,7 @@ class PlanCompiler:
             plan.placement = "mixed"
             plan.cache_policy = "working_set"
             plan.fetch_policy = "async"
+            plan.use_chunked_cpu_store = self._can_use_chunked_cpu_store(selection)
             return
         if selection.requires_scores:
             plan.granularity = "token"
@@ -118,3 +126,34 @@ class PlanCompiler:
             plan.placement = "gpu"
             plan.cache_policy = "recent"
             plan.fetch_policy = "prefetch"
+            plan.use_chunked_cpu_store = self._can_use_chunked_cpu_store(selection)
+
+    def _can_use_chunked_cpu_store(self, selection: SelectionPlan) -> bool:
+        mode = self.config.chunked_cpu_store
+        if mode == "off":
+            return False
+        if mode == "on":
+            return True
+        if selection.combine.lower() not in ("union", "priority"):
+            return False
+        if not selection.specs:
+            return False
+        return all(self._spec_is_chunk_friendly(spec) for spec in selection.specs)
+
+    def _spec_is_chunk_friendly(self, spec) -> bool:
+        if isinstance(spec, SlidingWindowSelectionSpec):
+            return True
+        if isinstance(spec, RetrievalSelectionSpec):
+            return True
+        if isinstance(spec, FixedSelectionSpec):
+            return spec.type == "sink"
+        return False
+
+    def _infer_working_set_layout(self, plan: ExecutionPlan) -> None:
+        layout = self.config.working_set_layout
+        if layout == "token":
+            plan.use_chunked_working_set = False
+        elif layout == "chunk":
+            plan.use_chunked_working_set = True
+        else:
+            plan.use_chunked_working_set = bool(plan.use_chunked_cpu_store)

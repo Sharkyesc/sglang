@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import torch
-
-from sglang.srt.layers.attention.sparse_framework.kv_store import get_cpu_kv_store
 from sglang.srt.layers.attention.sparse_framework.callback_registry import (
     SelectionCallbackRegistry,
 )
@@ -261,7 +259,11 @@ class RetrievalSelector:
         prefix_len: int,
         suffix_len: int,
     ) -> list[int] | None:
-        store = get_cpu_kv_store(ctx.framework_state)
+        store = (
+            ctx.framework_state.get("cpu_kv_store")
+            if ctx.framework_state is not None
+            else None
+        )
         if store is None or not candidate_positions:
             return None
 

@@ -15,6 +15,29 @@ def rebuild_packed_kv_indices(state: dict) -> None:
     )
 
 
+def cpu_kv_store_enabled(state: dict | None) -> bool:
+    if state is None:
+        return False
+    plan = state.get("execution_plan")
+    return bool(
+        getattr(plan, "enable_host_backup_on_evict", False)
+        or getattr(plan, "enable_physical_eviction", False)
+    )
+
+
+def configure_cpu_kv_store_from_state(store, state: dict | None) -> None:
+    if store is None or state is None:
+        return
+    configure = getattr(store, "configure_chunking", None)
+    if not callable(configure):
+        return
+    plan = state.get("execution_plan")
+    configure(
+        enabled=bool(getattr(plan, "use_chunked_cpu_store", False)),
+        chunk_size=int(getattr(plan, "chunk_size", 16)),
+    )
+
+
 def rewrite_selected_kv_indices_from_entries(state: dict, entries) -> int:
     selected_cache_keys = state.get("selected_cache_keys") or []
     selected_kv_indices = state.get("selected_kv_indices") or []

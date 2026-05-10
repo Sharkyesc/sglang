@@ -25,12 +25,18 @@ from sglang.srt.layers.attention.sparse_framework.selection_spec import (
 
 class SelectOp(BaseSparseOp):
     def run(self, ctx, state: dict):
-        plan = state["execution_plan"].selection_plan
+        execution_plan = state["execution_plan"]
+        plan = execution_plan.selection_plan
         selected_positions = []
         selected_kv_indices = []
         selection_importance = []
         selection_contributions = []
+        selected_chunk_ids = []
         req_to_token = ctx.req_to_token_pool.req_to_token
+        use_chunked_cpu_store = bool(
+            getattr(execution_plan, "use_chunked_cpu_store", False)
+        )
+        chunk_size = max(1, int(getattr(execution_plan, "chunk_size", 16)))
 
         for request_index, seq_len in enumerate(ctx.seq_lens_cpu):
             req_pool_idx = int(ctx.req_pool_indices_cpu[request_index])
@@ -50,6 +56,12 @@ class SelectOp(BaseSparseOp):
                 positions, dtype=torch.long, device=ctx.seq_lens.device
             )
             selected_positions.append(position_tensor)
+            if use_chunked_cpu_store:
+                selected_chunk_ids.append(
+                    self._chunk_ids_for_positions(
+                        positions, chunk_size=chunk_size, device=ctx.seq_lens.device
+                    )
+                )
             if position_tensor.numel() == 0:
                 selected_kv_indices.append(
                     torch.empty(0, dtype=torch.long, device=req_to_token.device)
@@ -83,7 +95,28 @@ class SelectOp(BaseSparseOp):
         state["kv_indices"] = kv_indices
         state["selection_importance"] = selection_importance
         state["selection_contributions"] = selection_contributions
+        if use_chunked_cpu_store:
+            state["chunk_selection"] = {
+                "enabled": True,
+                "chunk_size": chunk_size,
+                "selected_chunk_ids": selected_chunk_ids,
+                "requested_chunks": sum(
+                    int(chunk_ids.numel()) for chunk_ids in selected_chunk_ids
+                ),
+            }
         return selected_positions
+
+    def _chunk_ids_for_positions(
+        self,
+        positions: list[int],
+        *,
+        chunk_size: int,
+        device,
+    ) -> torch.Tensor:
+        if not positions:
+            return torch.empty(0, dtype=torch.long, device=device)
+        chunk_ids = sorted({int(pos) // int(chunk_size) for pos in positions})
+        return torch.tensor(chunk_ids, dtype=torch.long, device=device)
 
     def _positions_for_request(
         self,

@@ -17,6 +17,9 @@ class ExecutionPlan:
     enable_host_backup_on_evict: bool = False
     enable_physical_eviction: bool = False
     validate_kv_cache: bool = False
+    use_chunked_cpu_store: bool = False
+    use_chunked_working_set: bool = False
+    chunk_size: int = 16
     ops: list[object] = field(default_factory=list)
 
     @property

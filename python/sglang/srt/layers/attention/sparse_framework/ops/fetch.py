@@ -5,6 +5,8 @@ import torch
 from sglang.srt.layers.attention.sparse_framework.kv_store import get_cpu_kv_store
 from sglang.srt.layers.attention.sparse_framework.ops.base import BaseSparseOp
 from sglang.srt.layers.attention.sparse_framework.ops.utils import (
+    configure_cpu_kv_store_from_state,
+    cpu_kv_store_enabled,
     rewrite_selected_kv_indices_from_entries,
 )
 from sglang.srt.layers.attention.sparse_framework.residency import (
@@ -111,11 +113,14 @@ def _host_indices_tensor(indices: list[int], ctx) -> torch.Tensor:
 
 
 def _schedule_sparse_cpu_prefetch(ctx, state: dict) -> dict:
+    if not cpu_kv_store_enabled(state):
+        return {"requested": 0, "scheduled": 0, "reason": "cpu_kv_store_disabled"}
     if ctx.framework_state is None or ctx.layer is None:
         return {"requested": 0, "scheduled": 0, "reason": "missing_state_or_layer"}
     store = get_cpu_kv_store(ctx.framework_state)
     if store is None:
         return {"requested": 0, "scheduled": 0, "reason": "missing_sparse_cpu_store"}
+    configure_cpu_kv_store_from_state(store, state)
 
     selected_positions = state.get("selected_positions") or []
     selected_kv_indices = state.get("selected_kv_indices") or []
@@ -148,6 +153,12 @@ def _schedule_sparse_cpu_prefetch(ctx, state: dict) -> dict:
         item = pending.get(prefetch_key)
         if item is not None:
             already_pending += len(positions)
+            continue
+        position_pending = sum(
+            1 for pos in positions if (req_pool_idx, layer_id, int(pos)) in pending
+        )
+        if position_pending:
+            already_pending += position_pending
             continue
 
         get_many_async = getattr(store, "get_many_async", None)

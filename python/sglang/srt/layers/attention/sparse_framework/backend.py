@@ -232,6 +232,7 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             framework_state=self.framework_state,
         )
         plan = self.last_execution_plan or self.compiler.compile(ctx)
+        self._configure_cpu_store_for_plan(plan)
         state = {"execution_plan": plan}
         for op in plan.ops:
             op_name = type(op).__name__
@@ -252,11 +253,16 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             return
 
         store = self.framework_state.get("cpu_kv_store")
+        working_set = self.framework_state.get("working_set_buffer")
         table = get_residency_table(self.framework_state)
         tracker = get_eviction_tracker(self.framework_state)
         for req_pool_idx in req_pool_indices:
             if store is not None:
                 store.drop_request(req_pool_idx)
+            if working_set is not None:
+                drop_request = getattr(working_set, "drop_request", None)
+                if callable(drop_request):
+                    drop_request(req_pool_idx)
             table.drop_request(req_pool_idx)
             tracker.drop_request(req_pool_idx)
 
@@ -292,7 +298,8 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         self._logged_plan_signatures.add(signature)
         logger.info(
             "Sparse framework plan: mode=%s ops=%s fallback_backend=%s granularity=%s "
-            "placement=%s cache_policy=%s fetch_policy=%s uses_dense_fallback=%s",
+            "placement=%s cache_policy=%s fetch_policy=%s chunked_working_set=%s "
+            "uses_dense_fallback=%s",
             signature[0],
             "->".join(op_names),
             plan.fallback_backend,
@@ -300,8 +307,22 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             plan.placement,
             plan.cache_policy,
             plan.fetch_policy,
+            getattr(plan, "use_chunked_working_set", False),
             plan.uses_dense_fallback,
         )
+
+    def _configure_cpu_store_for_plan(self, plan) -> None:
+        if self.framework_state is None:
+            return
+        store = self.framework_state.get("cpu_kv_store")
+        if store is None:
+            return
+        configure = getattr(store, "configure_chunking", None)
+        if callable(configure):
+            configure(
+                enabled=bool(getattr(plan, "use_chunked_cpu_store", False)),
+                chunk_size=int(getattr(plan, "chunk_size", 16)),
+            )
 
     def _log_runtime_path(
         self,
@@ -332,8 +353,8 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             "Sparse framework runtime: phase=%s layer=%s path=%s attend_mode=%s "
             "fallback_reason=%s subset_unavailable_reason=%s selected_kv_counts=%s "
             "selection_contributions=%s cache_result=%s fetch_result=%s "
-            "evict_result=%s working_set_result=%s extend_store_result=%s "
-            "cpu_kv_store=%s forward_mode=%s profiler=%s",
+            "lookahead_prefetch_result=%s evict_result=%s working_set_result=%s "
+            "extend_store_result=%s cpu_kv_store=%s forward_mode=%s profiler=%s",
             phase,
             layer_id,
             path,
@@ -344,6 +365,7 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             contribution_preview,
             state.get("cache_result"),
             state.get("fetch_result"),
+            state.get("lookahead_prefetch_result"),
             state.get("evict_result"),
             state.get("working_set_result"),
             state.get("extend_store_result"),

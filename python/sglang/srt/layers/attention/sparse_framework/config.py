@@ -19,6 +19,9 @@ class SparseFrameworkConfig:
     enable_physical_eviction: bool = False
     validate_kv_cache: bool = False
     profiler_config: dict[str, Any] | None = None
+    chunked_cpu_store: str = "auto"
+    chunk_size: int = 16
+    working_set_layout: str = "auto"
 
     @classmethod
     def from_server_args(cls, server_args: Any) -> "SparseFrameworkConfig":
@@ -67,4 +70,31 @@ class SparseFrameworkConfig:
                 data.get("validate_kv_cache", data.get("debug_validate_kv_cache", False))
             ),
             profiler_config=profiler_config,
+            chunked_cpu_store=_normalize_chunked_cpu_store(
+                data.get("chunked_cpu_store", data.get("enable_chunked_cpu_store", "auto"))
+            ),
+            chunk_size=max(1, int(data.get("chunk_size", 16))),
+            working_set_layout=_normalize_working_set_layout(
+                data.get("working_set_layout", "auto")
+            ),
         )
+
+
+def _normalize_chunked_cpu_store(value: Any) -> str:
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    normalized = str(value).lower()
+    if normalized in ("1", "true", "yes", "on", "enabled"):
+        return "on"
+    if normalized in ("0", "false", "no", "off", "disabled"):
+        return "off"
+    return "auto"
+
+
+def _normalize_working_set_layout(value: Any) -> str:
+    normalized = str(value).lower()
+    if normalized in ("chunk", "chunked", "chunks"):
+        return "chunk"
+    if normalized in ("token", "tokens", "row", "rows"):
+        return "token"
+    return "auto"
