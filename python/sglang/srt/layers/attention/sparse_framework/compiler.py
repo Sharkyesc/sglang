@@ -146,7 +146,7 @@ class PlanCompiler:
         if isinstance(spec, RetrievalSelectionSpec):
             return True
         if isinstance(spec, FixedSelectionSpec):
-            return spec.type == "sink"
+            return spec.type in ("fixed", "sink")
         return False
 
     def _infer_working_set_layout(self, plan: ExecutionPlan) -> None:

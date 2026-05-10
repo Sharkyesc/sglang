@@ -15,6 +15,9 @@ from sglang.srt.layers.attention.sparse_framework.kv_store import get_cpu_kv_sto
 from sglang.srt.layers.attention.sparse_framework.ops.ensure_resident import (
     ensure_full_kv_resident,
 )
+from sglang.srt.layers.attention.sparse_framework.ops.utils import (
+    configure_cpu_kv_store_from_state,
+)
 from sglang.srt.layers.attention.sparse_framework.profiler import (
     SparseFrameworkProfiler,
     SparseProfilerConfig,
@@ -183,9 +186,40 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        return self.fallback.forward_extend(
+        ctx = SparseRuntimeContext.from_batch(
+            self.model_runner,
+            forward_batch,
+            layer=layer,
+            host_pool=self.host_pool,
+            cache_controller=self.cache_controller,
+            query=q,
+            key=k,
+            value=v,
+            save_kv_cache=save_kv_cache,
+            kwargs=kwargs,
+            framework_state=self.framework_state,
+        )
+        plan = self.compiler.compile(ctx)
+        self._configure_cpu_store_for_plan(plan)
+        output = self.fallback.forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
         )
+        if (
+            bool(getattr(plan, "enable_host_backup_on_evict", False))
+            or bool(getattr(plan, "enable_physical_eviction", False))
+        ):
+            get_cpu_kv_store(self.framework_state)
+            self._configure_cpu_store_for_plan(plan)
+            state = {"execution_plan": plan}
+            state["extend_store_result"] = self._store_extend_kv_to_cpu(
+                layer,
+                forward_batch,
+                k,
+                v,
+                save_kv_cache=save_kv_cache,
+            )
+            self._log_runtime_path("extend", layer, forward_batch, state, "dense_store")
+        return output
 
     def forward_mixed(
         self,

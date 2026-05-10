@@ -81,9 +81,16 @@ class RequestLayerKV:
             self.pending_events.pop(pos, None)
             return
 
+        key = key.detach()
+        value = value.detach()
+        if key.device.type == "cuda":
+            copy_stream.wait_stream(torch.cuda.current_stream(device=key.device))
         with torch.cuda.stream(copy_stream):
-            self.key_buffer[offset].copy_(key.detach(), non_blocking=True)
-            self.value_buffer[offset].copy_(value.detach(), non_blocking=True)
+            self.key_buffer[offset].copy_(key, non_blocking=True)
+            self.value_buffer[offset].copy_(value, non_blocking=True)
+            if key.device.type == "cuda":
+                key.record_stream(copy_stream)
+                value.record_stream(copy_stream)
             event = torch.cuda.Event()
             event.record(copy_stream)
         self.pending_events[pos] = event
@@ -157,13 +164,20 @@ class RequestLayerKV:
             self.pending_chunk_events.pop((chunk_id, chunk_offset), None)
             return
 
+        key = key.detach()
+        value = value.detach()
+        if key.device.type == "cuda":
+            copy_stream.wait_stream(torch.cuda.current_stream(device=key.device))
         with torch.cuda.stream(copy_stream):
             self.chunk_key_buffer[offset, chunk_offset].copy_(
-                key.detach(), non_blocking=True
+                key, non_blocking=True
             )
             self.chunk_value_buffer[offset, chunk_offset].copy_(
-                value.detach(), non_blocking=True
+                value, non_blocking=True
             )
+            if key.device.type == "cuda":
+                key.record_stream(copy_stream)
+                value.record_stream(copy_stream)
             event = torch.cuda.Event()
             event.record(copy_stream)
         self.pending_chunk_events[(chunk_id, chunk_offset)] = event

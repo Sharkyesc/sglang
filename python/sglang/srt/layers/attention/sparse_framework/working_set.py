@@ -10,6 +10,7 @@ class ChunkWorkingSetEntry:
     chunk_ids: list[int]
     key_buffers: list[torch.Tensor]
     value_buffers: list[torch.Tensor]
+    valid_positions: set[int]
     active: int = 0
 
     @property
@@ -111,7 +112,10 @@ class SparseWorkingSetBuffer:
                 ),
             ]
             entry = ChunkWorkingSetEntry(
-                chunk_ids=[], key_buffers=key_buffers, value_buffers=value_buffers
+                chunk_ids=[],
+                key_buffers=key_buffers,
+                value_buffers=value_buffers,
+                valid_positions=set(),
             )
             self.chunk_entries[cache_key] = entry
 
@@ -129,6 +133,7 @@ class SparseWorkingSetBuffer:
         new_value = entry.value_buffers[entry.inactive]
 
         hit_chunks = 0
+        retained_valid_positions: set[int] = set()
         for chunk_id, new_slot in new_chunk_to_slot.items():
             old_slot = old_chunk_to_slot.get(chunk_id)
             if old_slot is None:
@@ -136,6 +141,11 @@ class SparseWorkingSetBuffer:
             new_key[new_slot].copy_(old_key[old_slot])
             new_value[new_slot].copy_(old_value[old_slot])
             hit_chunks += 1
+            retained_valid_positions.update(
+                pos
+                for pos in entry.valid_positions
+                if int(pos) // chunk_size == int(chunk_id)
+            )
 
         chunk_slot_indices = torch.tensor(
             [new_chunk_to_slot[int(pos) // chunk_size] for pos in positions],
@@ -158,6 +168,9 @@ class SparseWorkingSetBuffer:
         key_out = new_key[chunk_slot_indices, inner_offsets]
         value_out = new_value[chunk_slot_indices, inner_offsets]
         entry.chunk_ids = chunk_ids
+        entry.valid_positions = retained_valid_positions.union(
+            {int(pos) for pos in positions}
+        )
         entry.active = entry.inactive
         return key_out, value_out, {
             "enabled": True,
@@ -194,16 +207,25 @@ class SparseWorkingSetBuffer:
         )
         entry = self.chunk_entries.get(cache_key)
         resident = set(entry.chunk_ids) if entry is not None else set()
+        valid_positions = entry.valid_positions if entry is not None else set()
         miss_chunks = [chunk_id for chunk_id in chunk_ids if chunk_id not in resident]
+        missing_requested_positions = [
+            int(pos)
+            for pos in positions
+            if int(pos) // chunk_size in resident and int(pos) not in valid_positions
+        ]
         if full_miss_units:
             miss_positions = self._expand_units(
                 miss_chunks, unit_size=chunk_size, max_position=max_position
             )
+            miss_positions.extend(missing_requested_positions)
         else:
             miss_chunk_set = set(miss_chunks)
             miss_positions = [
                 int(pos) for pos in positions if int(pos) // chunk_size in miss_chunk_set
             ]
+            miss_positions.extend(missing_requested_positions)
+        miss_positions = list(dict.fromkeys(miss_positions))
         return {
             "enabled": True,
             "layout": "unit",
@@ -260,6 +282,7 @@ class SparseWorkingSetBuffer:
             initial_capacity = max(needed_chunks, 1)
             entry = ChunkWorkingSetEntry(
                 chunk_ids=[],
+                valid_positions=set(),
                 key_buffers=[
                     torch.empty((initial_capacity, chunk_size) + tuple(key_shape_tail), dtype=key_dtype, device=device),
                     torch.empty((initial_capacity, chunk_size) + tuple(key_shape_tail), dtype=key_dtype, device=device),
@@ -290,6 +313,7 @@ class SparseWorkingSetBuffer:
         new_value = entry.value_buffers[entry.inactive]
 
         hit_chunks = 0
+        retained_valid_positions: set[int] = set()
         for chunk_id, new_slot in new_chunk_to_slot.items():
             old_slot = old_chunk_to_slot.get(chunk_id)
             if old_slot is None:
@@ -297,6 +321,11 @@ class SparseWorkingSetBuffer:
             new_key[new_slot].copy_(old_key[old_slot])
             new_value[new_slot].copy_(old_value[old_slot])
             hit_chunks += 1
+            retained_valid_positions.update(
+                pos
+                for pos in entry.valid_positions
+                if int(pos) // chunk_size == int(chunk_id)
+            )
 
         if key is not None and value is not None and materialized_positions:
             materialized_chunk_slots = torch.tensor(
@@ -326,6 +355,9 @@ class SparseWorkingSetBuffer:
         key_out = new_key[chunk_slot_indices, inner_offsets]
         value_out = new_value[chunk_slot_indices, inner_offsets]
         entry.chunk_ids = chunk_ids
+        entry.valid_positions = retained_valid_positions.union(
+            {int(pos) for pos in materialized_positions}
+        )
         entry.active = entry.inactive
         return key_out, value_out, {
             "enabled": True,

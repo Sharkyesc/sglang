@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.sparse_framework.ops.base import BaseSparseOp
 from sglang.srt.layers.attention.sparse_framework.ops.utils import (
     configure_cpu_kv_store_from_state,
     cpu_kv_store_enabled,
+    rebuild_packed_kv_indices,
 )
 from sglang.srt.layers.attention.sparse_framework.working_set import (
     get_working_set_buffer,
@@ -60,6 +61,7 @@ class AttendOp(BaseSparseOp):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
+            self._rewrite_current_decode_indices(ctx, state)
             self._store_current_decode_kv(ctx, layer, k, v, state)
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -94,6 +96,11 @@ class AttendOp(BaseSparseOp):
                 state=state,
             )
             h2d_event = ws_stats.pop("_h2d_event", None)
+            if key_subset is None or value_subset is None:
+                working_set_stats.append(ws_stats)
+                state["working_set_result"] = working_set_stats
+                state.setdefault("subset_unavailable_reason", "missing_working_set")
+                return None
             records.append(
                 {
                     "batch_idx": batch_idx,
@@ -248,6 +255,43 @@ class AttendOp(BaseSparseOp):
             output_view[batch_idx : batch_idx + 1] = per_req_out
             attention_weights[batch_idx] = per_req_weights
         return "torch_per_request"
+
+    def _rewrite_current_decode_indices(self, ctx, state: dict) -> None:
+        selected_positions = state.get("selected_positions") or []
+        selected_kv_indices = state.get("selected_kv_indices") or []
+        out_cache_locs = getattr(ctx, "out_cache_locs_cpu", [])
+        if not selected_positions or not selected_kv_indices or not out_cache_locs:
+            return
+        req_to_token = ctx.req_to_token_pool.req_to_token
+        updated = 0
+        for batch_idx, req_pool_idx in enumerate(ctx.req_pool_indices_cpu):
+            if (
+                batch_idx >= len(selected_positions)
+                or batch_idx >= len(selected_kv_indices)
+                or batch_idx >= len(out_cache_locs)
+                or batch_idx >= len(ctx.seq_lens_cpu)
+            ):
+                continue
+            current_position = int(ctx.seq_lens_cpu[batch_idx]) - 1
+            cache_loc = int(out_cache_locs[batch_idx])
+            if current_position < 0 or cache_loc < 0:
+                continue
+            if current_position < int(req_to_token.shape[1]):
+                req_to_token[int(req_pool_idx), current_position] = cache_loc
+            positions = selected_positions[batch_idx]
+            if int(positions.numel()) == 0:
+                continue
+            matches = positions == current_position
+            if not bool(matches.any().item()):
+                continue
+            kv_indices = selected_kv_indices[batch_idx].clone()
+            kv_indices[matches.to(device=kv_indices.device)] = cache_loc
+            selected_kv_indices[batch_idx] = kv_indices
+            updated += int(matches.sum().item())
+        if updated:
+            state["selected_kv_indices"] = selected_kv_indices
+            rebuild_packed_kv_indices(state)
+        state["current_decode_rewrite"] = {"updated": updated}
 
     def _store_current_decode_kv(
         self, ctx, layer, key: torch.Tensor, value: torch.Tensor, state: dict
@@ -440,12 +484,32 @@ class AttendOp(BaseSparseOp):
             value_subset = cpu_values
             gpu_fallback_count = 0
         elif cpu_keys is None or cpu_values is None:
+            cpu_missing_gpu_available = int((fetch_token_indices >= 0).sum().item())
+            cpu_missing_gpu_unavailable = int((fetch_token_indices < 0).sum().item())
+            if cpu_missing_gpu_unavailable:
+                state["subset_unavailable_reason"] = "missing_kv_not_resident"
+                return None, None, {
+                    "requested": len(token_positions),
+                    "cpu": 0,
+                    "gpu_fallback": 0,
+                    "cpu_missing": len(missing_positions),
+                    "cpu_missing_gpu_available": cpu_missing_gpu_available,
+                    "cpu_missing_gpu_unavailable": cpu_missing_gpu_unavailable,
+                    "buffered": 0,
+                    "kv_cache_check": None,
+                    "prefetched": prefetch is not None,
+                    "h2d_async": False,
+                    "chunk_fetch": chunk_fetch_stats,
+                    "working_set_delta": {
+                        "enabled": bool(use_delta),
+                        "reason": "missing_kv_not_resident",
+                    },
+                    "_h2d_event": None,
+                }
             key_subset = k_cache[fetch_token_indices]
             value_subset = v_cache[fetch_token_indices]
             h2d_event = None
             gpu_fallback_count = int(fetch_token_indices.numel())
-            cpu_missing_gpu_available = int((fetch_token_indices >= 0).sum().item())
-            cpu_missing_gpu_unavailable = int((fetch_token_indices < 0).sum().item())
             self._snapshot_missing_to_cpu(
                 store,
                 req_pool_idx=req_pool_idx,
@@ -469,6 +533,26 @@ class AttendOp(BaseSparseOp):
             missing_token_indices = fetch_token_indices[missing_index_tensor]
             cpu_missing_gpu_available = int((missing_token_indices >= 0).sum().item())
             cpu_missing_gpu_unavailable = int((missing_token_indices < 0).sum().item())
+            if cpu_missing_gpu_unavailable:
+                state["subset_unavailable_reason"] = "missing_kv_not_resident"
+                return None, None, {
+                    "requested": len(token_positions),
+                    "cpu": len(cpu_positions),
+                    "gpu_fallback": 0,
+                    "cpu_missing": len(missing_positions),
+                    "cpu_missing_gpu_available": cpu_missing_gpu_available,
+                    "cpu_missing_gpu_unavailable": cpu_missing_gpu_unavailable,
+                    "buffered": 0,
+                    "kv_cache_check": None,
+                    "prefetched": prefetch is not None,
+                    "h2d_async": False,
+                    "chunk_fetch": chunk_fetch_stats,
+                    "working_set_delta": {
+                        "enabled": bool(use_delta),
+                        "reason": "missing_kv_not_resident",
+                    },
+                    "_h2d_event": None,
+                }
             gpu_keys = k_cache[missing_token_indices]
             gpu_values = v_cache[missing_token_indices]
             key_parts = []

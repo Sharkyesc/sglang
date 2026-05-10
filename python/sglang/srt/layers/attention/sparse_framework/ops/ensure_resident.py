@@ -24,6 +24,7 @@ def ensure_full_kv_resident(ctx, state: dict) -> dict:
         return {"needed": 0, "fetched": 0, "reason": "missing_layer_or_state"}
 
     table = get_residency_table(ctx.framework_state)
+    store = get_cpu_kv_store(ctx.framework_state)
     layer_id = int(layer.layer_id)
     host_entries: list[KVResidencyEntry] = []
     sparse_cpu_entries: list[KVResidencyEntry] = []
@@ -45,6 +46,24 @@ def ensure_full_kv_resident(ctx, state: dict) -> dict:
                         step=table.next_step(),
                     )
                 else:
+                    if _has_sparse_cpu_row(
+                        store,
+                        req_pool_idx=req_pool_idx,
+                        layer_id=layer_id,
+                        position=position,
+                    ):
+                        entry = KVResidencyEntry(
+                            req_pool_idx=int(req_pool_idx),
+                            layer_id=layer_id,
+                            position=int(position),
+                            device_index=None,
+                            host_index=None,
+                            state="host",
+                            backup_source="sparse_cpu",
+                        )
+                        table.add_entry(entry)
+                        sparse_cpu_entries.append(entry)
+                        continue
                     missing_entries.append((req_pool_idx, layer_id, position))
                     continue
             if entry.state == "gpu" and entry.device_index is not None:
@@ -58,6 +77,14 @@ def ensure_full_kv_resident(ctx, state: dict) -> dict:
                 if device_index >= 0:
                     table.mark_gpu(entry, device_index=device_index)
                     req_to_token[req_pool_idx, position] = device_index
+                elif _has_sparse_cpu_row(
+                    store,
+                    req_pool_idx=req_pool_idx,
+                    layer_id=layer_id,
+                    position=position,
+                ):
+                    table.mark_sparse_cpu_backup(entry, keep_device_index=False)
+                    sparse_cpu_entries.append(entry)
                 else:
                     missing_entries.append((req_pool_idx, layer_id, position))
 
@@ -226,6 +253,33 @@ def _restore_sparse_cpu_entries(ctx, layer, entries: list[KVResidencyEntry]) -> 
         "restored": restored,
         "allocated_slots": allocated_slots,
     }
+
+
+def _has_sparse_cpu_row(
+    store,
+    *,
+    req_pool_idx: int,
+    layer_id: int,
+    position: int,
+) -> bool:
+    if store is None:
+        return False
+    layer_store = getattr(store, "layers", {}).get((int(req_pool_idx), int(layer_id)))
+    if layer_store is not None:
+        position_to_offset = getattr(layer_store, "position_to_offset", {})
+        if int(position) in position_to_offset:
+            wait_position = getattr(layer_store, "wait_position", None)
+            if callable(wait_position):
+                wait_position(int(position))
+            return True
+    ready_positions = getattr(store, "ready_positions", None)
+    if callable(ready_positions):
+        return int(position) in ready_positions(
+            req_pool_idx=int(req_pool_idx),
+            layer_id=int(layer_id),
+            positions=[int(position)],
+        )
+    return False
 
 
 def _host_indices_tensor(indices: list[int], ctx) -> torch.Tensor:
