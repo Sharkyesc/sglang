@@ -148,6 +148,15 @@ def _schedule_sparse_cpu_prefetch(ctx, state: dict) -> dict:
         kv_indices_cpu = [int(x) for x in selected_kv_indices[batch_idx].detach().cpu().tolist()]
         if not positions:
             continue
+        offloaded = [
+            (pos, kv_index)
+            for pos, kv_index in zip(positions, kv_indices_cpu)
+            if int(kv_index) < 0
+        ]
+        if not offloaded:
+            continue
+        positions = [pos for pos, _ in offloaded]
+        kv_indices_cpu = [kv_index for _, kv_index in offloaded]
         requested += len(positions)
         prefetch_key = (req_pool_idx, layer_id, tuple(positions))
         item = pending.get(prefetch_key)

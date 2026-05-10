@@ -388,7 +388,9 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             "fallback_reason=%s subset_unavailable_reason=%s selected_kv_counts=%s "
             "selection_contributions=%s cache_result=%s fetch_result=%s "
             "lookahead_prefetch_result=%s evict_result=%s working_set_result=%s "
-            "extend_store_result=%s cpu_kv_store=%s forward_mode=%s profiler=%s",
+            "triton_torch_output_check=%s subset_attention_kernel_replaced=%s "
+            "current_decode_rewrite=%s subset_tensor_debug=%s extend_store_result=%s "
+            "cpu_kv_store=%s forward_mode=%s profiler=%s",
             phase,
             layer_id,
             path,
@@ -402,6 +404,10 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             state.get("lookahead_prefetch_result"),
             state.get("evict_result"),
             state.get("working_set_result"),
+            state.get("triton_torch_output_check"),
+            state.get("subset_attention_kernel_replaced"),
+            state.get("current_decode_rewrite"),
+            state.get("subset_tensor_debug"),
             state.get("extend_store_result"),
             self._cpu_kv_store_stats(),
             getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode)),

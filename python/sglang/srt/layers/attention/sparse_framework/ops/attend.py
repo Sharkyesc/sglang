@@ -137,6 +137,7 @@ class AttendOp(BaseSparseOp):
                     attention_weights=attention_weights,
                     layer=layer,
                     requires_scores=requires_scores,
+                    state=state,
                 )
             )
         for record in pending_records:
@@ -152,6 +153,7 @@ class AttendOp(BaseSparseOp):
                     attention_weights=attention_weights,
                     layer=layer,
                     requires_scores=requires_scores,
+                    state=state,
                 )
             )
 
@@ -176,11 +178,18 @@ class AttendOp(BaseSparseOp):
         attention_weights: list,
         layer,
         requires_scores: bool,
+        state: dict,
     ) -> str:
         if not records:
             return "none"
         key_subsets = [record["key"] for record in records]
         value_subsets = [record["value"] for record in records]
+        state["subset_tensor_debug"] = {
+            "records": len(records),
+            "key_shapes": [tuple(item.shape) for item in key_subsets if item is not None],
+            "value_shapes": [tuple(item.shape) for item in value_subsets if item is not None],
+            "q_shape": tuple(q_view.shape),
+        }
         if all(
             key is not None and value is not None
             for key, value in zip(key_subsets, value_subsets)
@@ -235,6 +244,25 @@ class AttendOp(BaseSparseOp):
                     q_head_num=layer.tp_q_head_num,
                     kv_head_num=layer.tp_k_head_num,
                 )
+            if self._should_validate_subset_kernel(state):
+                torch_output, torch_weights = self._compute_record_group_torch(
+                    records,
+                    q_view=q_view,
+                    layer=layer,
+                )
+                max_abs_diff = (group_output - torch_output).abs().max()
+                check = {
+                    "max_abs_diff": float(max_abs_diff.item()),
+                    "records": len(records),
+                }
+                state["triton_torch_output_check"] = check
+                if float(check["max_abs_diff"]) > 1e-2:
+                    group_output = torch_output
+                    for local_idx, batch_idx in enumerate(batch_indices):
+                        attention_weights[batch_idx] = torch_weights[local_idx]
+                    state["subset_attention_kernel_replaced"] = (
+                        "triton_to_torch_per_request"
+                    )
             output_view[batch_indices] = group_output
             return (
                 "triton_batched_sparse_decode_with_weights"
@@ -255,6 +283,33 @@ class AttendOp(BaseSparseOp):
             output_view[batch_idx : batch_idx + 1] = per_req_out
             attention_weights[batch_idx] = per_req_weights
         return "torch_per_request"
+
+    def _should_validate_subset_kernel(self, state: dict) -> bool:
+        plan = state.get("execution_plan")
+        return bool(getattr(plan, "validate_kv_cache", False))
+
+    def _compute_record_group_torch(
+        self,
+        records: list[dict],
+        *,
+        q_view: torch.Tensor,
+        layer,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        outputs = []
+        weights = []
+        for record in records:
+            batch_idx = int(record["batch_idx"])
+            per_req_out, per_req_weights = self._compute_subset_attention(
+                q_view[batch_idx : batch_idx + 1],
+                record["key"],
+                record["value"],
+                scaling=layer.scaling,
+                q_head_num=layer.tp_q_head_num,
+                kv_head_num=layer.tp_k_head_num,
+            )
+            outputs.append(per_req_out[0])
+            weights.append(per_req_weights)
+        return torch.stack(outputs), weights
 
     def _rewrite_current_decode_indices(self, ctx, state: dict) -> None:
         selected_positions = state.get("selected_positions") or []
@@ -420,13 +475,32 @@ class AttendOp(BaseSparseOp):
         cpu_missing_gpu_unavailable = 0
         h2d_event = None
         chunk_fetch_stats = None
-        prefetch = self._consume_sparse_cpu_prefetch(
-            ctx,
-            req_pool_idx=req_pool_idx,
-            layer_id=int(layer.layer_id),
-            positions=fetch_positions,
+        gpu_resident_fetch = bool(
+            fetch_positions
+            and int(fetch_token_indices.numel()) == len(fetch_positions)
+            and bool((fetch_token_indices >= 0).all().item())
         )
-        if prefetch is not None:
+        if gpu_resident_fetch:
+            key_subset = k_cache[fetch_token_indices]
+            value_subset = v_cache[fetch_token_indices]
+            cpu_keys = None
+            cpu_values = None
+            cpu_positions = []
+            missing_positions = []
+            gpu_fallback_count = int(fetch_token_indices.numel())
+            prefetch = None
+        else:
+            key_subset = None
+            value_subset = None
+            prefetch = self._consume_sparse_cpu_prefetch(
+                ctx,
+                req_pool_idx=req_pool_idx,
+                layer_id=int(layer.layer_id),
+                positions=fetch_positions,
+            )
+        if gpu_resident_fetch:
+            pass
+        elif prefetch is not None:
             cpu_keys, cpu_values, cpu_positions, h2d_event = prefetch
             cpu_position_set = {int(pos) for pos in cpu_positions}
             missing_positions = [
@@ -479,7 +553,9 @@ class AttendOp(BaseSparseOp):
                     )
         elif use_delta and not fetch_positions:
             missing_positions = []
-        if not missing_positions:
+        if gpu_resident_fetch:
+            pass
+        elif not missing_positions:
             key_subset = cpu_keys
             value_subset = cpu_values
             gpu_fallback_count = 0
@@ -696,6 +772,7 @@ class AttendOp(BaseSparseOp):
             "buffered": int(key_subset.shape[0]) if key_subset is not None else 0,
             "kv_cache_check": validation,
             "prefetched": prefetch is not None,
+            "gpu_resident_preferred": gpu_resident_fetch,
             "h2d_async": h2d_event is not None,
             "chunk_fetch": chunk_fetch_stats,
             "working_set_delta": delta_stats,

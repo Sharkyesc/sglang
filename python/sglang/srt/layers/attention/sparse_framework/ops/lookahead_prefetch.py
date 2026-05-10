@@ -102,6 +102,15 @@ class LookaheadPrefetchOp(BaseSparseOp):
             positions = [int(pos) for pos in positions if int(pos) >= 0]
             if not positions:
                 continue
+            req_to_token = ctx.req_to_token_pool.req_to_token
+            max_len = int(req_to_token.shape[1])
+            positions = [
+                pos
+                for pos in positions
+                if pos < max_len and int(req_to_token[req_pool_idx, pos].item()) < 0
+            ]
+            if not positions:
+                continue
             requested += len(positions)
 
             candidate_positions = [
