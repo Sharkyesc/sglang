@@ -475,7 +475,12 @@ class AttendOp(BaseSparseOp):
         cpu_missing_gpu_unavailable = 0
         h2d_event = None
         chunk_fetch_stats = None
+        resident_only_gpu_kv = bool(
+            getattr(ctx.token_to_kv_pool, "is_sparse_layerwise_staging_pool", False)
+        )
         gpu_resident_fetch = bool(
+            not resident_only_gpu_kv
+            and
             fetch_positions
             and int(fetch_token_indices.numel()) == len(fetch_positions)
             and bool((fetch_token_indices >= 0).all().item())
@@ -565,7 +570,7 @@ class AttendOp(BaseSparseOp):
         elif cpu_keys is None or cpu_values is None:
             cpu_missing_gpu_available = int((fetch_token_indices >= 0).sum().item())
             cpu_missing_gpu_unavailable = int((fetch_token_indices < 0).sum().item())
-            if cpu_missing_gpu_unavailable:
+            if resident_only_gpu_kv or cpu_missing_gpu_unavailable:
                 state["subset_unavailable_reason"] = "missing_kv_not_resident"
                 return None, None, {
                     "requested": len(token_positions),
@@ -612,7 +617,7 @@ class AttendOp(BaseSparseOp):
             missing_token_indices = fetch_token_indices[missing_index_tensor]
             cpu_missing_gpu_available = int((missing_token_indices >= 0).sum().item())
             cpu_missing_gpu_unavailable = int((missing_token_indices < 0).sum().item())
-            if cpu_missing_gpu_unavailable:
+            if resident_only_gpu_kv or cpu_missing_gpu_unavailable:
                 state["subset_unavailable_reason"] = "missing_kv_not_resident"
                 return None, None, {
                     "requested": len(token_positions),

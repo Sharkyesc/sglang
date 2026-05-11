@@ -67,7 +67,15 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         if not callable(is_decode) or not is_decode():
             self.last_execution_plan = None
             self._runtime_log_count = 0
-            self._drop_sparse_request_state(forward_batch)
+            is_extend = getattr(forward_batch.forward_mode, "is_extend", None)
+            keep_prefill_cpu_kv = (
+                callable(is_extend)
+                and is_extend()
+                and self.config.resident_only_gpu_kv
+                and self.config.prefill_layerwise_offload
+            )
+            if not keep_prefill_cpu_kv:
+                self._drop_sparse_request_state(forward_batch)
             return self.fallback.init_forward_metadata(forward_batch)
 
         ctx = SparseRuntimeContext.from_batch(
@@ -204,6 +212,9 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         )
         plan = self.compiler.compile(ctx)
         self._configure_cpu_store_for_plan(plan)
+        extend_stage_result = self._stage_layerwise_extend_prefix_from_cpu(
+            layer, forward_batch, plan
+        )
         output = self.fallback.forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
         )
@@ -213,7 +224,10 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         ):
             get_cpu_kv_store(self.framework_state)
             self._configure_cpu_store_for_plan(plan)
-            state = {"execution_plan": plan}
+            state = {
+                "execution_plan": plan,
+                "extend_stage_result": extend_stage_result,
+            }
             state["extend_store_result"] = self._store_extend_kv_to_cpu(
                 layer,
                 forward_batch,
@@ -355,7 +369,9 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             "Sparse framework backend initialized: fallback=%s selection=%s combine=%s "
             "working_set_budget_tokens=%s host_backup_on_evict=%s physical_eviction=%s "
             "physical_eviction_interval=%s physical_eviction_slack_tokens=%s "
-            "lookahead_prefetch=%s profiler=%s debug_timing=%s debug_timing_output_file=%s",
+            "lookahead_prefetch=%s resident_only_gpu_kv=%s "
+            "prefill_layerwise_offload=%s profiler=%s debug_timing=%s "
+            "debug_timing_output_file=%s",
             self.config.dense_fallback_backend,
             self.config.selection,
             self.config.combine,
@@ -365,10 +381,81 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             self.config.physical_eviction_interval,
             self.config.physical_eviction_slack_tokens,
             self.config.enable_lookahead_prefetch,
+            self.config.resident_only_gpu_kv,
+            self.config.prefill_layerwise_offload,
             self.profiler.enabled,
             self.config.debug_timing,
             self.config.debug_timing_output_file,
         )
+
+    def _stage_layerwise_extend_prefix_from_cpu(self, layer, forward_batch, plan) -> dict:
+        if not bool(getattr(self.config, "resident_only_gpu_kv", False)):
+            return {"enabled": False, "reason": "resident_only_gpu_kv_disabled"}
+        if not bool(getattr(self.config, "prefill_layerwise_offload", False)):
+            return {"enabled": False, "reason": "prefill_layerwise_offload_disabled"}
+        token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
+        if not getattr(token_to_kv_pool, "is_sparse_layerwise_staging_pool", False):
+            return {"enabled": False, "reason": "not_sparse_layerwise_pool"}
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
+        if prefix_lens is None:
+            return {"enabled": True, "staged": 0, "reason": "missing_prefix_lens"}
+        store = get_cpu_kv_store(self.framework_state)
+        if store is None:
+            return {"enabled": False, "reason": "missing_cpu_store"}
+
+        layer_id = int(getattr(layer, "layer_id"))
+        key_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+        value_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+        device = key_buffer.device
+        dtype = key_buffer.dtype
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        req_pool_indices = self._tensor_or_list_to_ints(
+            getattr(forward_batch, "req_pool_indices", None)
+        )
+        prefix_lens_cpu = self._tensor_or_list_to_ints(prefix_lens)
+        staged = 0
+        missing = 0
+        requests = 0
+        for batch_idx, req_pool_idx in enumerate(req_pool_indices):
+            if batch_idx >= len(prefix_lens_cpu):
+                break
+            prefix_len = max(0, int(prefix_lens_cpu[batch_idx]))
+            if prefix_len <= 0:
+                continue
+            requests += 1
+            positions = list(range(prefix_len))
+            keys, values, found_positions, missing_positions, event = store.get_many_async(
+                req_pool_idx=int(req_pool_idx),
+                layer_id=layer_id,
+                positions=positions,
+                device=device,
+                dtype=dtype,
+            )
+            missing += len(missing_positions)
+            if keys is None or values is None or not found_positions:
+                continue
+            if event is not None:
+                torch.cuda.current_stream(device=device).wait_event(event)
+            found_tensor = torch.tensor(
+                found_positions, dtype=torch.long, device=req_to_token.device
+            )
+            slot_tensor = req_to_token[int(req_pool_idx), found_tensor].long()
+            valid = slot_tensor >= 0
+            if not bool(valid.any().item()):
+                continue
+            slot_tensor = slot_tensor[valid]
+            keys = keys[valid]
+            values = values[valid]
+            key_buffer[slot_tensor] = keys
+            value_buffer[slot_tensor] = values
+            staged += int(slot_tensor.numel())
+        return {
+            "enabled": True,
+            "requests": requests,
+            "staged": staged,
+            "missing": missing,
+            "layer": layer_id,
+        }
 
     def _log_plan_once(self, forward_batch, plan) -> None:
         op_names = tuple(type(op).__name__ for op in plan.ops)
@@ -470,7 +557,8 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             "evict_timing_ms=%s "
             "triton_torch_output_check=%s subset_attention_kernel_replaced=%s "
             "current_decode_rewrite=%s subset_tensor_debug=%s extend_store_result=%s "
-            "extend_evict_result=%s cpu_kv_store=%s forward_mode=%s profiler=%s op_timings_ms=%s",
+            "extend_stage_result=%s extend_evict_result=%s cpu_kv_store=%s "
+            "forward_mode=%s profiler=%s op_timings_ms=%s",
             phase,
             layer_id,
             path,
@@ -492,6 +580,7 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             state.get("current_decode_rewrite"),
             state.get("subset_tensor_debug"),
             state.get("extend_store_result"),
+            state.get("extend_stage_result"),
             state.get("extend_evict_result"),
             self._cpu_kv_store_stats(),
             getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode)),
@@ -535,6 +624,7 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             "working_set_result": state.get("working_set_result"),
             "subset_tensor_debug": state.get("subset_tensor_debug"),
             "current_decode_rewrite": state.get("current_decode_rewrite"),
+            "extend_stage_result": state.get("extend_stage_result"),
             "extend_evict_result": state.get("extend_evict_result"),
             "profiler": state.get("profiler"),
         }
@@ -641,6 +731,7 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             start_pos = max(0, seq_len - extend_len)
             if (
                 int(layer.layer_id) == 0
+                and start_pos == 0
                 and int(req_pool_idx) not in dropped_req_pool_indices
             ):
                 dropped_request_layers += store.drop_request(int(req_pool_idx))

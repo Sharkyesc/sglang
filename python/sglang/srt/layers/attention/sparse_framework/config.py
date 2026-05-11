@@ -27,6 +27,8 @@ class SparseFrameworkConfig:
     chunked_cpu_store: str = "auto"
     chunk_size: int = 16
     working_set_layout: str = "auto"
+    resident_only_gpu_kv: bool = False
+    prefill_layerwise_offload: bool = False
 
     @classmethod
     def from_server_args(cls, server_args: Any) -> "SparseFrameworkConfig":
@@ -102,6 +104,13 @@ class SparseFrameworkConfig:
             chunk_size=max(1, int(data.get("chunk_size", 16))),
             working_set_layout=_normalize_working_set_layout(
                 data.get("working_set_layout", "auto")
+            ),
+            resident_only_gpu_kv=bool(data.get("resident_only_gpu_kv", False)),
+            prefill_layerwise_offload=bool(
+                data.get(
+                    "prefill_layerwise_offload",
+                    data.get("prefill_layerwise_async_offload", False),
+                )
             ),
         )
 
