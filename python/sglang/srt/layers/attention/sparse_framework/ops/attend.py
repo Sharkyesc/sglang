@@ -428,7 +428,14 @@ class AttendOp(BaseSparseOp):
             else None
         )
         configure_cpu_kv_store_from_state(store, state)
-        buffer = get_working_set_buffer(ctx.framework_state)
+        resident_only_gpu_kv = bool(
+            getattr(ctx.token_to_kv_pool, "is_sparse_layerwise_staging_pool", False)
+        )
+        buffer = (
+            None
+            if resident_only_gpu_kv
+            else get_working_set_buffer(ctx.framework_state)
+        )
         req_pool_idx = int(ctx.req_pool_indices_cpu[batch_idx])
         plan = state.get("execution_plan")
         chunk_selection = state.get("chunk_selection") or {}
@@ -475,9 +482,6 @@ class AttendOp(BaseSparseOp):
         cpu_missing_gpu_unavailable = 0
         h2d_event = None
         chunk_fetch_stats = None
-        resident_only_gpu_kv = bool(
-            getattr(ctx.token_to_kv_pool, "is_sparse_layerwise_staging_pool", False)
-        )
         gpu_resident_fetch = bool(
             not resident_only_gpu_kv
             and

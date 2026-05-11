@@ -24,6 +24,43 @@ class CacheOp(BaseSparseOp):
         table = get_residency_table(ctx.framework_state)
         tracker = get_eviction_tracker(ctx.framework_state)
         step = table.next_step()
+        resident_only_gpu_kv = bool(
+            getattr(ctx.token_to_kv_pool, "is_sparse_layerwise_staging_pool", False)
+        )
+        if resident_only_gpu_kv:
+            misses = []
+            miss_slots = []
+            selected_cache_keys = []
+            total = 0
+            for batch_idx, req_pool_idx in enumerate(ctx.req_pool_indices_cpu):
+                batch_keys = []
+                if batch_idx >= len(selected_positions) or batch_idx >= len(selected_kv_indices):
+                    selected_cache_keys.append(batch_keys)
+                    continue
+                positions = selected_positions[batch_idx].detach().cpu().tolist()
+                total += len(positions)
+                for offset, pos in enumerate(positions):
+                    key = (req_pool_idx, layer_id, int(pos))
+                    batch_keys.append(key)
+                    miss_slots.append((batch_idx, offset, key))
+                selected_cache_keys.append(batch_keys)
+            state["cache_hits"] = []
+            state["cache_misses"] = misses
+            state["cache_miss_slots"] = miss_slots
+            state["selected_cache_keys"] = selected_cache_keys
+            state["active_cache_keys"] = set()
+            state["eviction_candidates"] = []
+            state["cache_result"] = {
+                "enabled": True,
+                "resident_only": True,
+                "hits": 0,
+                "misses": total,
+                "entries": len(table.entries),
+                "live_gpu": 0,
+                "live_gpu_tokens": 0,
+                "cache_policy": getattr(plan, "cache_policy", "working_set"),
+            }
+            return None
 
         hits = []
         misses = []
@@ -47,14 +84,17 @@ class CacheOp(BaseSparseOp):
                 importance = float(importance_by_position.get(int(pos), 0.0))
                 active_keys.add(key)
                 batch_keys.append(key)
-                if int(device_index) < 0:
+                if resident_only_gpu_kv or int(device_index) < 0:
                     entry = table.entries.get(key)
                     if entry is None:
                         entry = KVResidencyEntry(
                             req_pool_idx=req_pool_idx,
                             layer_id=layer_id,
                             position=int(pos),
-                            state="evicted",
+                            state="host" if resident_only_gpu_kv else "evicted",
+                            backup_source=(
+                                "sparse_cpu" if resident_only_gpu_kv else "none"
+                            ),
                             last_access_step=step,
                             access_count=1,
                         )

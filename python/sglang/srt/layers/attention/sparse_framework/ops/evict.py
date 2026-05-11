@@ -18,6 +18,13 @@ class EvictOp(BaseSparseOp):
         plan = state["execution_plan"]
         timing = _EvictTiming(enabled=bool(getattr(plan, "debug_timing", False)))
         budget = plan.working_set_budget_tokens
+        if bool(getattr(ctx.token_to_kv_pool, "is_sparse_layerwise_staging_pool", False)):
+            state["evict_result"] = {
+                "evicted": 0,
+                "reason": "resident_only_layerwise_staging",
+            }
+            timing.finish(state)
+            return None
         if budget is None or ctx.framework_state is None:
             state["evict_result"] = {"evicted": 0, "reason": "no_budget"}
             timing.finish(state)

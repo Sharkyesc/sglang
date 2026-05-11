@@ -29,6 +29,9 @@ from sglang.srt.layers.attention.sparse_framework.residency import get_residency
 from sglang.srt.layers.attention.sparse_framework.runtime_context import (
     SparseRuntimeContext,
 )
+from sglang.srt.layers.attention.sparse_framework.state_registry import (
+    register_framework_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,7 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         self.last_execution_plan = None
         self.last_selection_state: dict | None = None
         self.framework_state: dict = {}
+        register_framework_state(self.framework_state)
         self.profiler = SparseFrameworkProfiler(
             SparseProfilerConfig.from_dict(self.config.profiler_config)
         )
@@ -358,8 +362,19 @@ class SparseFrameworkAttnBackend(AttentionBackend):
                 drop_request = getattr(working_set, "drop_request", None)
                 if callable(drop_request):
                     drop_request(req_pool_idx)
+            self._drop_sparse_pending_prefetches(req_pool_idx)
             table.drop_request(req_pool_idx)
             tracker.drop_request(req_pool_idx)
+
+    def _drop_sparse_pending_prefetches(self, req_pool_idx: int) -> int:
+        pending = self.framework_state.get("sparse_cpu_prefetches")
+        if not pending:
+            return 0
+        req_pool_idx = int(req_pool_idx)
+        keys = [key for key in pending if isinstance(key, tuple) and key and int(key[0]) == req_pool_idx]
+        for key in keys:
+            del pending[key]
+        return len(keys)
 
     def _log_init_once(self) -> None:
         if self._logged_init:
@@ -735,6 +750,7 @@ class SparseFrameworkAttnBackend(AttentionBackend):
                 and int(req_pool_idx) not in dropped_req_pool_indices
             ):
                 dropped_request_layers += store.drop_request(int(req_pool_idx))
+                self._drop_sparse_pending_prefetches(int(req_pool_idx))
                 dropped_req_pool_indices.add(int(req_pool_idx))
             positions = list(range(start_pos, start_pos + actual_len))
             written += store.put(
