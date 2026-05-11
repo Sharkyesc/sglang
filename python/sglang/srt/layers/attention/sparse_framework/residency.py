@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import heapq
+
 from dataclasses import dataclass
 from typing import Literal
 
@@ -44,6 +46,7 @@ class KVResidencyTable:
     def __init__(self):
         self.entries: dict[tuple[int, int, int], KVResidencyEntry] = {}
         self.entries_by_token: dict[tuple[int, int], set[tuple[int, int, int]]] = {}
+        self.gpu_tokens: set[tuple[int, int]] = set()
         self.step = 0
 
     def next_step(self) -> int:
@@ -63,6 +66,7 @@ class KVResidencyTable:
         self.entries[key] = entry
         token_key = (int(entry.req_pool_idx), int(entry.position))
         self.entries_by_token.setdefault(token_key, set()).add(key)
+        self._refresh_gpu_token(token_key)
 
     def entries_for_token(
         self, req_pool_idx: int, position: int
@@ -111,6 +115,7 @@ class KVResidencyTable:
         entry.backup_source = "none"
         entry.last_access_step = step
         entry.access_count += 1
+        self._refresh_gpu_token((int(entry.req_pool_idx), int(entry.position)))
         return entry, is_miss
 
     def mark_host(
@@ -129,6 +134,7 @@ class KVResidencyTable:
             entry.device_index = None
         entry.state = "host" if entry.host_index is not None else "evicted"
         entry.version += 1
+        self._refresh_gpu_token((int(entry.req_pool_idx), int(entry.position)))
 
     def mark_sparse_cpu_backup(
         self,
@@ -142,6 +148,7 @@ class KVResidencyTable:
         entry.backup_source = "sparse_cpu"
         entry.state = "host"
         entry.version += 1
+        self._refresh_gpu_token((int(entry.req_pool_idx), int(entry.position)))
 
     def mark_gpu(
         self,
@@ -153,6 +160,7 @@ class KVResidencyTable:
         entry.state = "gpu"
         entry.backup_source = "none"
         entry.version += 1
+        self._refresh_gpu_token((int(entry.req_pool_idx), int(entry.position)))
 
     def live_gpu_count(self) -> int:
         return sum(1 for entry in self.entries.values() if entry.state == "gpu")
@@ -170,6 +178,19 @@ class KVResidencyTable:
             }
         )
 
+    def live_gpu_stats(self) -> tuple[int, int]:
+        entries = 0
+        tokens = set()
+        for entry in self.entries.values():
+            if (
+                entry.state == "gpu"
+                and entry.device_index is not None
+                and int(entry.device_index) >= 0
+            ):
+                entries += 1
+                tokens.add(int(entry.device_index))
+        return entries, len(tokens)
+
     def drop_request(self, req_pool_idx: int) -> int:
         req_pool_idx = int(req_pool_idx)
         keys_to_drop = [
@@ -183,12 +204,14 @@ class KVResidencyTable:
                 token_entries.discard(key)
                 if not token_entries:
                     del self.entries_by_token[token_key]
+            self._refresh_gpu_token(token_key)
         return len(keys_to_drop)
 
     def eviction_candidates(
         self,
         active_keys: set[tuple[int, int, int]],
         cache_policy: str = "working_set",
+        limit: int | None = None,
     ) -> list[KVResidencyEntry]:
         candidates = [
             entry
@@ -196,32 +219,94 @@ class KVResidencyTable:
             if key not in active_keys and entry.state == "gpu" and entry.device_index is not None
         ]
         cache_policy = (cache_policy or "working_set").lower()
-        if cache_policy == "recent":
-            candidates.sort(
-                key=lambda entry: (
-                    entry.position,
-                    entry.last_access_step,
-                    entry.access_count,
-                )
-            )
-        elif cache_policy == "priority":
-            candidates.sort(
-                key=lambda entry: (
-                    entry.selection_priority,
-                    entry.last_access_step,
-                    entry.access_count,
-                )
-            )
-        else:
-            candidates.sort(
-                key=lambda entry: (
-                    entry.last_selected_step,
-                    entry.selection_priority,
-                    entry.last_access_step,
-                    entry.access_count,
-                )
-            )
+        key_fn = self._eviction_key_fn(cache_policy)
+        if limit is not None and int(limit) > 0 and int(limit) < len(candidates):
+            return heapq.nsmallest(int(limit), candidates, key=key_fn)
+        candidates.sort(key=key_fn)
         return candidates
+
+    def token_eviction_candidates(
+        self,
+        active_tokens: set[tuple[int, int]],
+        cache_policy: str = "working_set",
+        limit: int | None = None,
+    ) -> list[KVResidencyEntry]:
+        cache_policy = (cache_policy or "working_set").lower()
+        key_fn = self._eviction_key_fn(cache_policy)
+        candidates = []
+        stale_tokens = []
+        for token_key in list(self.gpu_tokens):
+            token_key = (int(token_key[0]), int(token_key[1]))
+            if token_key in active_tokens:
+                continue
+            entry_keys = self.entries_by_token.get(token_key)
+            if not entry_keys:
+                stale_tokens.append(token_key)
+                continue
+            best = None
+            stale_entry_keys = []
+            for entry_key in entry_keys:
+                entry = self.entries.get(entry_key)
+                if entry is None:
+                    stale_entry_keys.append(entry_key)
+                    continue
+                if entry.state != "gpu" or entry.device_index is None:
+                    continue
+                if int(entry.device_index) < 0:
+                    continue
+                if best is None or key_fn(entry) < key_fn(best):
+                    best = entry
+            if best is not None:
+                candidates.append(best)
+            if stale_entry_keys:
+                entry_keys.difference_update(stale_entry_keys)
+                if not entry_keys:
+                    stale_tokens.append(token_key)
+        for token_key in stale_tokens:
+            self.entries_by_token.pop(token_key, None)
+            self.gpu_tokens.discard(token_key)
+        if limit is not None and int(limit) > 0 and int(limit) < len(candidates):
+            return heapq.nsmallest(int(limit), candidates, key=key_fn)
+        candidates.sort(key=key_fn)
+        return candidates
+
+    def _refresh_gpu_token(self, token_key: tuple[int, int]) -> None:
+        token_key = (int(token_key[0]), int(token_key[1]))
+        entry_keys = self.entries_by_token.get(token_key)
+        if not entry_keys:
+            self.gpu_tokens.discard(token_key)
+            return
+        for entry_key in entry_keys:
+            entry = self.entries.get(entry_key)
+            if (
+                entry is not None
+                and entry.state == "gpu"
+                and entry.device_index is not None
+                and int(entry.device_index) >= 0
+            ):
+                self.gpu_tokens.add(token_key)
+                return
+        self.gpu_tokens.discard(token_key)
+
+    def _eviction_key_fn(self, cache_policy: str):
+        if cache_policy == "recent":
+            return lambda entry: (
+                entry.position,
+                entry.last_access_step,
+                entry.access_count,
+            )
+        if cache_policy == "priority":
+            return lambda entry: (
+                entry.selection_priority,
+                entry.last_access_step,
+                entry.access_count,
+            )
+        return lambda entry: (
+            entry.last_selected_step,
+            entry.selection_priority,
+            entry.last_access_step,
+            entry.access_count,
+        )
 
 
 def get_residency_table(framework_state: dict) -> KVResidencyTable:

@@ -16,7 +16,10 @@ class ExecutionPlan:
     working_set_budget_tokens: int | None = None
     enable_host_backup_on_evict: bool = False
     enable_physical_eviction: bool = False
+    physical_eviction_interval: int = 1
+    physical_eviction_slack_tokens: int = 0
     validate_kv_cache: bool = False
+    debug_timing: bool = False
     use_chunked_cpu_store: bool = False
     use_chunked_working_set: bool = False
     chunk_size: int = 16

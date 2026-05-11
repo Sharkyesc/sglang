@@ -26,10 +26,12 @@ class RetrievalSelector:
         request_index: int,
         req_pool_idx: int,
         seq_len: int,
+        timing=None,
     ) -> list[int]:
         self.last_stats = {}
         self.last_priority = {}
         if spec.name or spec.import_path or spec.fn:
+            start = timing.start() if timing is not None else 0.0
             positions = self._callback_positions(
                 spec,
                 ctx,
@@ -37,6 +39,13 @@ class RetrievalSelector:
                 req_pool_idx=req_pool_idx,
                 seq_len=seq_len,
             )
+            if timing is not None:
+                timing.add(
+                    "retrieval_callback",
+                    start,
+                    request_index=request_index,
+                    count=len(positions),
+                )
             self._set_stats(
                 prefix_len=0,
                 suffix_len=0,
@@ -54,10 +63,20 @@ class RetrievalSelector:
                 request_index=request_index,
                 req_pool_idx=req_pool_idx,
                 seq_len=seq_len,
+                timing=timing,
             )
             if positions is not None:
                 return positions
-        return self._fallback_positions(spec, seq_len)
+        start = timing.start() if timing is not None else 0.0
+        positions = self._fallback_positions(spec, seq_len)
+        if timing is not None:
+            timing.add(
+                "retrieval_fallback",
+                start,
+                request_index=request_index,
+                count=len(positions),
+            )
+        return positions
 
     def _callback_positions(
         self,
@@ -116,6 +135,7 @@ class RetrievalSelector:
         request_index: int,
         req_pool_idx: int,
         seq_len: int,
+        timing=None,
     ) -> list[int] | None:
         layer = ctx.layer
         query = ctx.query
@@ -124,8 +144,17 @@ class RetrievalSelector:
         if ctx.req_to_token_pool is None or ctx.token_to_kv_pool is None:
             return None
 
+        start = timing.start() if timing is not None else 0.0
         prefix_len, suffix_len = self._static_span_lengths(spec, seq_len)
         selected = self._static_positions(prefix_len, suffix_len, seq_len)
+        if timing is not None:
+            timing.add(
+                "retrieval_static_spans",
+                start,
+                request_index=request_index,
+                prefix=prefix_len,
+                suffix=suffix_len,
+            )
 
         middle_start = prefix_len
         middle_end = max(middle_start, seq_len - suffix_len)
@@ -143,12 +172,20 @@ class RetrievalSelector:
             )
             return positions
 
+        start = timing.start() if timing is not None else 0.0
         candidate_positions = torch.arange(
             middle_start,
             middle_end,
             dtype=torch.long,
             device=ctx.seq_lens.device,
         )
+        if timing is not None:
+            timing.add(
+                "retrieval_candidate_arange",
+                start,
+                request_index=request_index,
+                middle=int(candidate_positions.numel()),
+            )
         if candidate_positions.numel() == 0:
             positions = sorted(selected)
             self.last_priority = self._rank_priority(positions)
@@ -163,27 +200,86 @@ class RetrievalSelector:
             )
             return positions
 
+        start = timing.start() if timing is not None else 0.0
+        candidate_positions_cpu = candidate_positions.detach().cpu().tolist()
+        if timing is not None:
+            timing.add(
+                "retrieval_candidate_to_cpu",
+                start,
+                request_index=request_index,
+                middle=len(candidate_positions_cpu),
+            )
+
+        start = timing.start() if timing is not None else 0.0
         cpu_positions = self._cpu_index_positions(
             spec,
             ctx,
             req_pool_idx=req_pool_idx,
             layer_id=int(layer.layer_id),
             query=query.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)[request_index],
-            candidate_positions=candidate_positions.detach().cpu().tolist(),
+            candidate_positions=candidate_positions_cpu,
             selected=selected,
             seq_len=seq_len,
             prefix_len=prefix_len,
             suffix_len=suffix_len,
+            timing=timing,
         )
+        if timing is not None:
+            timing.add(
+                "retrieval_cpu_index_total",
+                start,
+                request_index=request_index,
+                hit=cpu_positions is not None,
+            )
         if cpu_positions is not None:
             return cpu_positions
 
         req_to_token = ctx.req_to_token_pool.req_to_token
+        start = timing.start() if timing is not None else 0.0
         candidate_kv_indices = req_to_token[req_pool_idx, candidate_positions].to(
             torch.long
         )
+        valid_mask = candidate_kv_indices >= 0
+        if timing is not None:
+            timing.add(
+                "retrieval_gather_candidate_indices",
+                start,
+                request_index=request_index,
+                candidates=int(candidate_kv_indices.numel()),
+            )
+        if not bool(valid_mask.any().item()):
+            positions = sorted(selected)
+            self.last_priority = self._rank_priority(positions)
+            self._set_stats(
+                prefix_len=prefix_len,
+                suffix_len=suffix_len,
+                retrieval_len=0,
+                total_len=len(positions),
+                method="similarity",
+                budget=0,
+                middle_len=int(candidate_positions.numel()),
+            )
+            return positions
+        start = timing.start() if timing is not None else 0.0
+        candidate_positions = candidate_positions[valid_mask]
+        candidate_kv_indices = candidate_kv_indices[valid_mask]
+        if timing is not None:
+            timing.add(
+                "retrieval_apply_valid_mask",
+                start,
+                request_index=request_index,
+                valid=int(candidate_kv_indices.numel()),
+            )
         key_cache = ctx.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        start = timing.start() if timing is not None else 0.0
         candidate_keys = key_cache[candidate_kv_indices]
+        if timing is not None:
+            timing.add(
+                "retrieval_gather_candidate_keys",
+                start,
+                request_index=request_index,
+                valid=int(candidate_kv_indices.numel()),
+            )
         if candidate_keys.numel() == 0:
             positions = sorted(selected)
             self.last_priority = self._rank_priority(positions)
@@ -199,12 +295,20 @@ class RetrievalSelector:
             return positions
 
         q = query.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)[request_index]
+        start = timing.start() if timing is not None else 0.0
         scores = self._score_candidates(
             q,
             candidate_keys,
             q_head_num=layer.tp_q_head_num,
             kv_head_num=layer.tp_k_head_num,
         )
+        if timing is not None:
+            timing.add(
+                "retrieval_score_candidates",
+                start,
+                request_index=request_index,
+                candidates=int(scores.numel()),
+            )
         retrieval_budget = self._retrieval_budget(spec, int(scores.numel()))
         k = min(retrieval_budget, int(scores.numel()))
         if k <= 0:
@@ -220,10 +324,27 @@ class RetrievalSelector:
                 middle_len=int(candidate_positions.numel()),
             )
             return positions
+        start = timing.start() if timing is not None else 0.0
         top_indices = torch.topk(scores, k=k, largest=True).indices
+        if timing is not None:
+            timing.add(
+                "retrieval_topk",
+                start,
+                request_index=request_index,
+                k=int(k),
+            )
+        start = timing.start() if timing is not None else 0.0
         retrieval_positions = [
             int(pos) for pos in candidate_positions[top_indices].tolist()
         ]
+        if timing is not None:
+            timing.add(
+                "retrieval_topk_to_positions",
+                start,
+                request_index=request_index,
+                count=len(retrieval_positions),
+            )
+        start = timing.start() if timing is not None else 0.0
         retrieval_positions = self._expand_positions_to_pages(
             retrieval_positions,
             seq_len=seq_len,
@@ -231,6 +352,14 @@ class RetrievalSelector:
             exclude=selected,
             page_size=max(1, int(getattr(ctx.model_runner, "page_size", 1))),
         )
+        if timing is not None:
+            timing.add(
+                "retrieval_expand_pages",
+                start,
+                request_index=request_index,
+                count=len(retrieval_positions),
+            )
+        start = timing.start() if timing is not None else 0.0
         selected.update(retrieval_positions)
         positions = sorted(selected)
         self.last_priority = self._rank_priority(retrieval_positions)
@@ -243,6 +372,13 @@ class RetrievalSelector:
             budget=retrieval_budget,
             middle_len=int(candidate_positions.numel()),
         )
+        if timing is not None:
+            timing.add(
+                "retrieval_finalize",
+                start,
+                request_index=request_index,
+                total=len(positions),
+            )
         return positions
 
     def _cpu_index_positions(
@@ -258,6 +394,7 @@ class RetrievalSelector:
         seq_len: int,
         prefix_len: int,
         suffix_len: int,
+        timing=None,
     ) -> list[int] | None:
         store = (
             ctx.framework_state.get("cpu_kv_store")
@@ -269,30 +406,47 @@ class RetrievalSelector:
 
         retrieval_budget = self._retrieval_budget(spec, len(candidate_positions))
         chunk_size = int(spec.kwargs.get("chunk_size", 16)) if spec.kwargs else 16
+        start = timing.start() if timing is not None else 0.0
         index = store.build_chunk_index(
             req_pool_idx=req_pool_idx,
             layer_id=layer_id,
             positions=candidate_positions,
             chunk_size=chunk_size,
         )
+        if timing is not None:
+            timing.add(
+                "retrieval_cpu_build_chunk_index",
+                start,
+                candidates=len(candidate_positions),
+            )
         if not index or not index.get("chunks"):
             return None
 
+        start = timing.start() if timing is not None else 0.0
         q = query.detach().to("cpu", dtype=torch.float32)
-        chunk_scores = []
-        for chunk in index["chunks"]:
-            centroid = chunk["centroid"]
-            if q_head_num := int(q.shape[0]):
-                if centroid.shape[0] != q_head_num and q_head_num % centroid.shape[0] == 0:
-                    centroid = centroid.repeat_interleave(q_head_num // centroid.shape[0], dim=0)
-            score = torch.einsum("hd,hd->h", q, centroid.to(torch.float32)).mean()
-            chunk_scores.append((float(score.item()), chunk["positions"]))
-        if not chunk_scores:
+        chunks = index["chunks"]
+        centroids = torch.stack(
+            [chunk["centroid"].to(torch.float32) for chunk in chunks], dim=0
+        )
+        q_head_num = int(q.shape[0])
+        if q_head_num and centroids.shape[1] != q_head_num and q_head_num % centroids.shape[1] == 0:
+            centroids = centroids.repeat_interleave(q_head_num // centroids.shape[1], dim=1)
+        scores = torch.einsum("hd,chd->ch", q, centroids).mean(dim=1)
+        ranked_chunk_indices = torch.argsort(scores, descending=True).tolist()
+        if timing is not None:
+            timing.add(
+                "retrieval_cpu_score_chunks",
+                start,
+                chunks=len(chunks),
+            )
+        if not ranked_chunk_indices:
             return None
 
+        start = timing.start() if timing is not None else 0.0
         retrieval_positions = []
         seen = set(selected)
-        for _, chunk_positions in sorted(chunk_scores, key=lambda item: item[0], reverse=True):
+        for chunk_idx in ranked_chunk_indices:
+            chunk_positions = chunks[int(chunk_idx)]["positions"]
             for pos in chunk_positions:
                 pos = int(pos)
                 if pos in seen:
@@ -303,7 +457,14 @@ class RetrievalSelector:
                     break
             if len(retrieval_positions) >= retrieval_budget:
                 break
+        if timing is not None:
+            timing.add(
+                "retrieval_cpu_select_chunks",
+                start,
+                count=len(retrieval_positions),
+            )
 
+        start = timing.start() if timing is not None else 0.0
         selected.update(retrieval_positions)
         positions = sorted(selected)
         self.last_priority = self._rank_priority(retrieval_positions)
@@ -316,6 +477,12 @@ class RetrievalSelector:
             budget=retrieval_budget,
             middle_len=len(candidate_positions),
         )
+        if timing is not None:
+            timing.add(
+                "retrieval_cpu_finalize",
+                start,
+                total=len(positions),
+            )
         return positions
 
     def _score_candidates(

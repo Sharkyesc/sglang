@@ -17,7 +17,12 @@ class SparseFrameworkConfig:
     working_set_budget_tokens: int | None = None
     enable_host_backup_on_evict: bool = False
     enable_physical_eviction: bool = False
+    physical_eviction_interval: int = 1
+    physical_eviction_slack_tokens: int = 0
     validate_kv_cache: bool = False
+    debug_timing: bool = False
+    debug_timing_output_file: str | None = None
+    enable_lookahead_prefetch: bool = True
     profiler_config: dict[str, Any] | None = None
     chunked_cpu_store: str = "auto"
     chunk_size: int = 16
@@ -66,8 +71,29 @@ class SparseFrameworkConfig:
             ),
             enable_host_backup_on_evict=bool(data.get("enable_host_backup_on_evict", False)),
             enable_physical_eviction=bool(data.get("enable_physical_eviction", False)),
+            physical_eviction_interval=max(
+                1, int(data.get("physical_eviction_interval", 1))
+            ),
+            physical_eviction_slack_tokens=max(
+                0, int(data.get("physical_eviction_slack_tokens", 0))
+            ),
             validate_kv_cache=bool(
                 data.get("validate_kv_cache", data.get("debug_validate_kv_cache", False))
+            ),
+            debug_timing=bool(data.get("debug_timing", False)),
+            debug_timing_output_file=(
+                str(
+                    data.get(
+                        "debug_timing_output_file",
+                        data.get("debug_timing_log_file"),
+                    )
+                )
+                if data.get("debug_timing_output_file", data.get("debug_timing_log_file"))
+                is not None
+                else None
+            ),
+            enable_lookahead_prefetch=bool(
+                data.get("enable_lookahead_prefetch", True)
             ),
             profiler_config=profiler_config,
             chunked_cpu_store=_normalize_chunked_cpu_store(

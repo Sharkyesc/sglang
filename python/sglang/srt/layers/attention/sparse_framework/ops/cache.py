@@ -27,6 +27,7 @@ class CacheOp(BaseSparseOp):
 
         hits = []
         misses = []
+        miss_slots = []
         active_keys = set()
         selected_cache_keys = []
         for batch_idx, req_pool_idx in enumerate(ctx.req_pool_indices_cpu):
@@ -77,28 +78,35 @@ class CacheOp(BaseSparseOp):
                     entry.last_selected_step = step
                 if is_miss:
                     misses.append(entry)
+                    miss_slots.append((batch_idx, len(batch_keys) - 1, key))
                 else:
                     hits.append(entry)
             selected_cache_keys.append(batch_keys)
 
         cache_policy = getattr(plan, "cache_policy", "working_set")
-        eviction_candidates = table.eviction_candidates(
-            active_keys,
-            cache_policy=cache_policy,
+        needs_eviction_stats = (
+            plan is not None
+            and getattr(plan, "working_set_budget_tokens", None) is not None
         )
+        if needs_eviction_stats:
+            live_gpu, live_gpu_tokens = table.live_gpu_stats()
+        else:
+            live_gpu = None
+            live_gpu_tokens = None
 
         state["cache_hits"] = hits
         state["cache_misses"] = misses
+        state["cache_miss_slots"] = miss_slots
         state["selected_cache_keys"] = selected_cache_keys
         state["active_cache_keys"] = active_keys
-        state["eviction_candidates"] = eviction_candidates
+        state["eviction_candidates"] = []
         state["cache_result"] = {
             "enabled": True,
             "hits": len(hits),
             "misses": len(misses),
             "entries": len(table.entries),
-            "live_gpu": table.live_gpu_count(),
-            "live_gpu_tokens": table.live_gpu_token_count(),
+            "live_gpu": live_gpu,
+            "live_gpu_tokens": live_gpu_tokens,
             "cache_policy": cache_policy,
         }
         return None

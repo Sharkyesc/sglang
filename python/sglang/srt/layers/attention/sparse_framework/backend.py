@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import time
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -218,6 +221,11 @@ class SparseFrameworkAttnBackend(AttentionBackend):
                 v,
                 save_kv_cache=save_kv_cache,
             )
+            state["extend_evict_result"] = self._post_extend_evict_to_budget(
+                layer,
+                forward_batch,
+                plan,
+            )
             self._log_runtime_path("extend", layer, forward_batch, state, "dense_store")
         return output
 
@@ -268,15 +276,54 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         plan = self.last_execution_plan or self.compiler.compile(ctx)
         self._configure_cpu_store_for_plan(plan)
         state = {"execution_plan": plan}
-        for op in plan.ops:
-            op_name = type(op).__name__
-            with self.profiler.record(f"sparse_framework/{op_name}"):
-                op.run(ctx, state)
+        if self.config.debug_timing:
+            state["op_timings_ms"] = self._run_plan_ops_with_timing(ctx, state, plan)
+        else:
+            for op in plan.ops:
+                op_name = type(op).__name__
+                with self.profiler.record(f"sparse_framework/{op_name}"):
+                    op.run(ctx, state)
         self.profiler.step()
         if self.profiler.enabled:
             state["profiler"] = self.profiler.state()
         self.last_selection_state = state
         return state
+
+    def _run_plan_ops_with_timing(self, ctx, state: dict, plan) -> list[dict]:
+        timings = []
+        timing_device = self._debug_timing_device(ctx)
+        total_start = time.perf_counter()
+        for op in plan.ops:
+            op_name = type(op).__name__
+            self._debug_timing_synchronize(timing_device)
+            op_start = time.perf_counter()
+            with self.profiler.record(f"sparse_framework/{op_name}"):
+                op.run(ctx, state)
+            self._debug_timing_synchronize(timing_device)
+            timings.append(
+                {
+                    "op": op_name,
+                    "ms": round((time.perf_counter() - op_start) * 1000, 3),
+                }
+            )
+        timings.append(
+            {
+                "op": "total",
+                "ms": round((time.perf_counter() - total_start) * 1000, 3),
+            }
+        )
+        return timings
+
+    def _debug_timing_device(self, ctx) -> torch.device | None:
+        for tensor in (ctx.query, ctx.key, ctx.value, ctx.seq_lens):
+            if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                return tensor.device
+        return None
+
+    def _debug_timing_synchronize(self, device: torch.device | None) -> None:
+        if device is None or not torch.cuda.is_available():
+            return
+        torch.cuda.synchronize(device)
 
     def _drop_sparse_request_state(self, forward_batch) -> None:
         req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
@@ -307,14 +354,20 @@ class SparseFrameworkAttnBackend(AttentionBackend):
         logger.info(
             "Sparse framework backend initialized: fallback=%s selection=%s combine=%s "
             "working_set_budget_tokens=%s host_backup_on_evict=%s physical_eviction=%s "
-            "profiler=%s",
+            "physical_eviction_interval=%s physical_eviction_slack_tokens=%s "
+            "lookahead_prefetch=%s profiler=%s debug_timing=%s debug_timing_output_file=%s",
             self.config.dense_fallback_backend,
             self.config.selection,
             self.config.combine,
             self.config.working_set_budget_tokens,
             self.config.enable_host_backup_on_evict,
             self.config.enable_physical_eviction,
+            self.config.physical_eviction_interval,
+            self.config.physical_eviction_slack_tokens,
+            self.config.enable_lookahead_prefetch,
             self.profiler.enabled,
+            self.config.debug_timing,
+            self.config.debug_timing_output_file,
         )
 
     def _log_plan_once(self, forward_batch, plan) -> None:
@@ -368,7 +421,21 @@ class SparseFrameworkAttnBackend(AttentionBackend):
     ) -> None:
         layer_id = getattr(layer, "layer_id", None)
         evicted = int((state.get("evict_result") or {}).get("evicted", 0) or 0)
-        if layer_id not in (None, 0) and evicted <= 0:
+        extend_evicted = int(
+            (state.get("extend_evict_result") or {}).get("freed_tokens", 0) or 0
+        )
+        expected_layers = self._expected_num_layers()
+        is_last_layer = (
+            expected_layers is not None
+            and layer_id is not None
+            and int(layer_id) == int(expected_layers) - 1
+        )
+        if (
+            layer_id not in (None, 0)
+            and evicted <= 0
+            and extend_evicted <= 0
+            and not (phase == "extend" and is_last_layer)
+        ):
             return
         if phase == "extend":
             self._runtime_log_count = 0
@@ -382,15 +449,28 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             selected_counts.append(-1)
         contributions = state.get("selection_contributions") or []
         contribution_preview = contributions[:2]
+        self._write_debug_timing_record(
+            phase=phase,
+            layer_id=layer_id,
+            path=path,
+            forward_mode=getattr(
+                forward_batch.forward_mode, "name", str(forward_batch.forward_mode)
+            ),
+            selected_counts=selected_counts,
+            contribution_preview=contribution_preview,
+            state=state,
+        )
 
         logger.info(
             "Sparse framework runtime: phase=%s layer=%s path=%s attend_mode=%s "
             "fallback_reason=%s subset_unavailable_reason=%s selected_kv_counts=%s "
-            "selection_contributions=%s cache_result=%s fetch_result=%s "
+            "selected_position_debug=%s selection_contributions=%s cache_result=%s fetch_result=%s "
+            "select_timing_ms=%s "
             "lookahead_prefetch_result=%s evict_result=%s working_set_result=%s "
+            "evict_timing_ms=%s "
             "triton_torch_output_check=%s subset_attention_kernel_replaced=%s "
             "current_decode_rewrite=%s subset_tensor_debug=%s extend_store_result=%s "
-            "cpu_kv_store=%s forward_mode=%s profiler=%s",
+            "extend_evict_result=%s cpu_kv_store=%s forward_mode=%s profiler=%s op_timings_ms=%s",
             phase,
             layer_id,
             path,
@@ -398,21 +478,103 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             state.get("fallback_reason"),
             state.get("subset_unavailable_reason"),
             selected_counts,
+            state.get("selected_position_debug"),
             contribution_preview,
             state.get("cache_result"),
             state.get("fetch_result"),
+            state.get("select_timing_ms"),
             state.get("lookahead_prefetch_result"),
             state.get("evict_result"),
             state.get("working_set_result"),
+            state.get("evict_timing_ms"),
             state.get("triton_torch_output_check"),
             state.get("subset_attention_kernel_replaced"),
             state.get("current_decode_rewrite"),
             state.get("subset_tensor_debug"),
             state.get("extend_store_result"),
+            state.get("extend_evict_result"),
             self._cpu_kv_store_stats(),
             getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode)),
             state.get("profiler"),
+            state.get("op_timings_ms"),
         )
+
+    def _write_debug_timing_record(
+        self,
+        *,
+        phase: str,
+        layer_id,
+        path: str,
+        forward_mode: str,
+        selected_counts: list[int],
+        contribution_preview,
+        state: dict,
+    ) -> None:
+        output_file = self.config.debug_timing_output_file
+        if not output_file:
+            return
+        record = {
+            "phase": phase,
+            "layer": layer_id,
+            "path": path,
+            "forward_mode": forward_mode,
+            "attend_mode": state.get("attend_mode"),
+            "fallback_reason": state.get("fallback_reason"),
+            "subset_unavailable_reason": state.get("subset_unavailable_reason"),
+            "selected_kv_counts": selected_counts,
+            "selected_position_debug": state.get("selected_position_debug"),
+            "selection_contributions": contribution_preview,
+            "op_timings_ms": state.get("op_timings_ms"),
+            "select_timing_ms": state.get("select_timing_ms"),
+            "evict_timing_ms": state.get("evict_timing_ms"),
+            "cache_result": state.get("cache_result"),
+            "fetch_result": state.get("fetch_result"),
+            "remap_result": state.get("remap_result"),
+            "lookahead_prefetch_result": state.get("lookahead_prefetch_result"),
+            "evict_result": state.get("evict_result"),
+            "working_set_result": state.get("working_set_result"),
+            "subset_tensor_debug": state.get("subset_tensor_debug"),
+            "current_decode_rewrite": state.get("current_decode_rewrite"),
+            "extend_evict_result": state.get("extend_evict_result"),
+            "profiler": state.get("profiler"),
+        }
+        try:
+            path_obj = Path(output_file)
+            path_obj.parent.mkdir(parents=True, exist_ok=True)
+            with path_obj.open("a", encoding="utf-8") as f:
+                f.write("\n=== sparse_framework_runtime ===\n")
+                json.dump(
+                    self._json_sanitize(record),
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                f.write("\n")
+        except Exception:
+            logger.exception(
+                "Failed to write sparse framework debug timing record to %s",
+                output_file,
+            )
+
+    def _json_sanitize(self, value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() <= 16:
+                return value.detach().cpu().tolist()
+            return {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "device": str(value.device),
+            }
+        if isinstance(value, dict):
+            return {str(k): self._json_sanitize(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._json_sanitize(item) for item in value]
+        if isinstance(value, set):
+            return [self._json_sanitize(item) for item in sorted(value)]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
 
     def _store_extend_kv_to_cpu(
         self,
@@ -505,6 +667,181 @@ class SparseFrameworkAttnBackend(AttentionBackend):
             "dropped_request_layers": dropped_request_layers,
             "truncated": truncated or offset != rows,
         }
+
+    def _post_extend_evict_to_budget(self, layer, forward_batch, plan) -> dict:
+        if not bool(getattr(plan, "enable_physical_eviction", False)):
+            return {"enabled": False, "reason": "physical_eviction_disabled"}
+        budget = getattr(plan, "working_set_budget_tokens", None)
+        if budget is None:
+            return {"enabled": False, "reason": "no_budget"}
+        expected_layers = self._expected_num_layers()
+        layer_id = getattr(layer, "layer_id", None)
+        if expected_layers is None or layer_id is None:
+            return {"enabled": False, "reason": "missing_layer_metadata"}
+        if int(layer_id) != int(expected_layers) - 1:
+            return {
+                "enabled": False,
+                "reason": "not_last_layer",
+                "layer": int(layer_id),
+                "expected_layers": int(expected_layers),
+            }
+
+        allocator = getattr(self.model_runner, "token_to_kv_pool_allocator", None)
+        if allocator is None:
+            return {"enabled": False, "reason": "missing_allocator"}
+        if int(getattr(allocator, "page_size", 1)) != 1:
+            return {"enabled": False, "reason": "paged_allocator_unsupported"}
+        store = self.framework_state.get("cpu_kv_store")
+        if store is None:
+            return {"enabled": False, "reason": "missing_cpu_store"}
+
+        req_pool_indices = self._tensor_or_list_to_ints(
+            getattr(forward_batch, "req_pool_indices", None)
+        )
+        seq_lens = self._tensor_or_list_to_ints(
+            getattr(forward_batch, "seq_lens_cpu", None)
+        )
+        if not seq_lens:
+            seq_lens = self._tensor_or_list_to_ints(getattr(forward_batch, "seq_lens", None))
+        if not req_pool_indices or not seq_lens:
+            return {"enabled": False, "reason": "missing_batch_metadata"}
+
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        max_positions = int(req_to_token.shape[1])
+        radix_owned = self._radix_owned_device_indices()
+        device_slots = []
+        req_updates = []
+        position_updates = []
+        checked = 0
+        skipped_backup = 0
+        skipped_radix = 0
+        skipped_invalid = 0
+        budget = max(0, int(budget))
+        for batch_idx, req_pool_idx in enumerate(req_pool_indices):
+            if batch_idx >= len(seq_lens):
+                break
+            seq_len = max(0, int(seq_lens[batch_idx]))
+            evict_until = max(0, seq_len - budget)
+            for position in range(min(evict_until, max_positions)):
+                checked += 1
+                device_index = int(req_to_token[int(req_pool_idx), position].item())
+                if device_index < 0:
+                    skipped_invalid += 1
+                    continue
+                if device_index in radix_owned:
+                    skipped_radix += 1
+                    continue
+                if not self._wait_complete_cpu_backup(
+                    store,
+                    req_pool_idx=int(req_pool_idx),
+                    position=position,
+                    expected_layers=expected_layers,
+                ):
+                    skipped_backup += 1
+                    continue
+                device_slots.append(device_index)
+                req_updates.append(int(req_pool_idx))
+                position_updates.append(position)
+
+        if not device_slots:
+            return {
+                "enabled": True,
+                "freed_tokens": 0,
+                "checked": checked,
+                "skipped_invalid": skipped_invalid,
+                "skipped_radix": skipped_radix,
+                "skipped_backup": skipped_backup,
+                "budget": budget,
+                "cuda_memory": self._cuda_memory_stats(),
+            }
+
+        cuda_memory_before = self._cuda_memory_stats()
+        unique_slots = sorted(set(device_slots))
+        free_slots = torch.tensor(unique_slots, dtype=torch.long, device=req_to_token.device)
+        setattr(allocator, "_sparse_framework_physical_eviction_active", True)
+        allocator.free(free_slots)
+        freed_slot_set = getattr(allocator, "_sparse_framework_freed_slots", None)
+        if freed_slot_set is None:
+            freed_slot_set = set()
+            setattr(allocator, "_sparse_framework_freed_slots", freed_slot_set)
+        freed_slot_set.update(unique_slots)
+        req_to_token[
+            torch.tensor(req_updates, dtype=torch.long, device=req_to_token.device),
+            torch.tensor(position_updates, dtype=torch.long, device=req_to_token.device),
+        ] = -1
+        return {
+            "enabled": True,
+            "freed_tokens": len(unique_slots),
+            "freed_positions": len(position_updates),
+            "checked": checked,
+            "skipped_invalid": skipped_invalid,
+            "skipped_radix": skipped_radix,
+            "skipped_backup": skipped_backup,
+            "budget": budget,
+            "cuda_memory_before": cuda_memory_before,
+            "cuda_memory_after": self._cuda_memory_stats(),
+        }
+
+    def _cuda_memory_stats(self) -> dict | None:
+        if not torch.cuda.is_available():
+            return None
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            return {
+                "free_mb": round(float(free_bytes) / (1024 * 1024), 2),
+                "total_mb": round(float(total_bytes) / (1024 * 1024), 2),
+                "allocated_mb": round(
+                    float(torch.cuda.memory_allocated()) / (1024 * 1024), 2
+                ),
+                "reserved_mb": round(
+                    float(torch.cuda.memory_reserved()) / (1024 * 1024), 2
+                ),
+            }
+        except Exception:
+            return None
+
+    def _wait_complete_cpu_backup(
+        self,
+        store,
+        *,
+        req_pool_idx: int,
+        position: int,
+        expected_layers: int,
+    ) -> bool:
+        for layer_id in range(int(expected_layers)):
+            layer_store = store.layers.get((int(req_pool_idx), int(layer_id)))
+            if layer_store is None:
+                return False
+            if int(position) not in layer_store.position_to_offset:
+                return False
+        for layer_id in range(int(expected_layers)):
+            layer_store = store.layers[(int(req_pool_idx), int(layer_id))]
+            layer_store.wait_position(int(position))
+            if self.config.chunked_cpu_store != "off":
+                chunk_size = max(1, int(getattr(layer_store, "chunk_size", 1)))
+                layer_store.wait_chunk_position(
+                    int(position) // chunk_size,
+                    int(position) % chunk_size,
+                )
+        return True
+
+    def _expected_num_layers(self) -> int | None:
+        model_config = getattr(self.model_runner, "model_config", None)
+        num_layers = getattr(model_config, "num_hidden_layers", None)
+        return int(num_layers) if num_layers is not None else None
+
+    def _radix_owned_device_indices(self) -> set[int]:
+        tree_cache = self.framework_state.get("tree_cache")
+        flatten = getattr(tree_cache, "all_values_flatten", None)
+        if not callable(flatten):
+            return set()
+        try:
+            values = flatten()
+        except Exception:
+            return set()
+        if values is None or int(values.numel()) == 0:
+            return set()
+        return {int(x) for x in values.detach().cpu().tolist() if int(x) >= 0}
 
     def _tensor_or_list_to_ints(self, value) -> list[int]:
         if value is None:

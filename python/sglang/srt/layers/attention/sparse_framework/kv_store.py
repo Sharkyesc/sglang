@@ -23,6 +23,8 @@ class RequestLayerKV:
     chunk_capacity: int = 0
     chunk_pinned: bool = False
     pending_chunk_events: dict[tuple[int, int], torch.cuda.Event] = field(default_factory=dict)
+    chunk_index_cache_version: int = -1
+    chunk_index_cache: dict[tuple[int, tuple[int, ...]], dict] = field(default_factory=dict)
 
     def ensure_capacity(
         self,
@@ -192,6 +194,8 @@ class RequestLayerKV:
         self.chunk_capacity = 0
         self.chunk_pinned = False
         self.pending_chunk_events.clear()
+        self.chunk_index_cache_version = -1
+        self.chunk_index_cache.clear()
 
     def has_position_ready(self, position: int) -> bool:
         pos = int(position)
@@ -584,9 +588,26 @@ class SparseCPUKVStore:
         if entry is None or entry.key_buffer is None:
             return None
         chunk_size = max(1, int(chunk_size))
+        if int(entry.chunk_index_cache_version) != int(entry.version):
+            entry.chunk_index_cache.clear()
+            entry.chunk_index_cache_version = int(entry.version)
         chunks = []
         for start in range(0, len(positions), chunk_size):
             chunk_positions = [int(pos) for pos in positions[start : start + chunk_size]]
+            cache_key = (chunk_size, tuple(chunk_positions))
+            cached = entry.chunk_index_cache.get(cache_key)
+            if cached is not None:
+                chunks.append(cached)
+                continue
+            item = self._build_chunk_index_item_from_chunk_buffer(
+                entry,
+                chunk_positions=chunk_positions,
+                chunk_size=chunk_size,
+            )
+            if item is not None:
+                entry.chunk_index_cache[cache_key] = item
+                chunks.append(item)
+                continue
             offsets, found_positions, _ = entry.get_offsets(chunk_positions)
             if not offsets:
                 continue
@@ -596,8 +617,39 @@ class SparseCPUKVStore:
                 .to(torch.float32)
                 .mean(dim=0)
             )
-            chunks.append({"positions": found_positions, "centroid": centroid})
+            item = {"positions": found_positions, "centroid": centroid}
+            entry.chunk_index_cache[cache_key] = item
+            chunks.append(item)
         return {"chunk_size": chunk_size, "chunks": chunks}
+
+    def _build_chunk_index_item_from_chunk_buffer(
+        self,
+        entry: RequestLayerKV,
+        *,
+        chunk_positions: list[int],
+        chunk_size: int,
+    ) -> dict | None:
+        if (
+            not self.chunking_enabled
+            or entry.chunk_key_buffer is None
+            or int(entry.chunk_size) != int(chunk_size)
+            or len(chunk_positions) != int(chunk_size)
+        ):
+            return None
+        first = int(chunk_positions[0])
+        if first % int(chunk_size) != 0:
+            return None
+        for offset, pos in enumerate(chunk_positions):
+            if int(pos) != first + offset:
+                return None
+            if int(pos) not in entry.position_to_offset:
+                return None
+        chunk_id = first // int(chunk_size)
+        chunk_slot = entry.chunk_id_to_offset.get(chunk_id)
+        if chunk_slot is None:
+            return None
+        centroid = entry.chunk_key_buffer[int(chunk_slot)].to(torch.float32).mean(dim=0)
+        return {"positions": chunk_positions, "centroid": centroid}
 
     def stats(self) -> dict:
         entries = 0

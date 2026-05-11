@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import torch
 
 from sglang.srt.layers.attention.sparse_framework.ops.base import BaseSparseOp
@@ -27,6 +29,7 @@ class SelectOp(BaseSparseOp):
     def run(self, ctx, state: dict):
         execution_plan = state["execution_plan"]
         plan = execution_plan.selection_plan
+        timing = _SelectTiming(enabled=bool(getattr(execution_plan, "debug_timing", False)))
         selected_positions = []
         selected_kv_indices = []
         selection_importance = []
@@ -40,6 +43,7 @@ class SelectOp(BaseSparseOp):
 
         for request_index, seq_len in enumerate(ctx.seq_lens_cpu):
             req_pool_idx = int(ctx.req_pool_indices_cpu[request_index])
+            start = timing.start()
             positions = self._positions_for_request(
                 plan.specs,
                 plan.combine,
@@ -47,30 +51,60 @@ class SelectOp(BaseSparseOp):
                 request_index=request_index,
                 req_pool_idx=req_pool_idx,
                 seq_len=seq_len,
+                timing=timing,
+            )
+            timing.add(
+                "request_positions",
+                start,
+                request_index=request_index,
+                seq_len=int(seq_len),
+                count=len(positions),
             )
             selection_contributions.append(
                 getattr(self, "_last_contribution_stats", {})
             )
             selection_importance.append(getattr(self, "_last_selection_importance", {}))
+            start = timing.start()
             position_tensor = torch.tensor(
                 positions, dtype=torch.long, device=ctx.seq_lens.device
             )
             selected_positions.append(position_tensor)
+            timing.add(
+                "position_tensor",
+                start,
+                request_index=request_index,
+                count=int(position_tensor.numel()),
+            )
             if use_chunked_cpu_store:
+                start = timing.start()
                 selected_chunk_ids.append(
                     self._chunk_ids_for_positions(
                         positions, chunk_size=chunk_size, device=ctx.seq_lens.device
                     )
+                )
+                timing.add(
+                    "chunk_ids",
+                    start,
+                    request_index=request_index,
+                    count=int(selected_chunk_ids[-1].numel()),
                 )
             if position_tensor.numel() == 0:
                 selected_kv_indices.append(
                     torch.empty(0, dtype=torch.long, device=req_to_token.device)
                 )
             else:
+                start = timing.start()
                 selected_kv_indices.append(
                     req_to_token[req_pool_idx, position_tensor].to(torch.long)
                 )
+                timing.add(
+                    "gather_kv_indices",
+                    start,
+                    request_index=request_index,
+                    count=int(selected_kv_indices[-1].numel()),
+                )
 
+        start = timing.start()
         kv_indptr = torch.zeros(
             len(selected_kv_indices) + 1, dtype=torch.int32, device=ctx.seq_lens.device
         )
@@ -88,9 +122,30 @@ class SelectOp(BaseSparseOp):
             )
         else:
             kv_indices = torch.empty(0, dtype=torch.long, device=req_to_token.device)
+        timing.add(
+            "pack_kv_indices",
+            start,
+            requests=len(selected_kv_indices),
+            total=int(kv_indptr[-1].item()) if int(kv_indptr.numel()) else 0,
+        )
 
         state["selected_positions"] = selected_positions
         state["selected_kv_indices"] = selected_kv_indices
+        state["selected_position_debug"] = [
+            {
+                "seq_len": int(ctx.seq_lens_cpu[idx])
+                if idx < len(ctx.seq_lens_cpu)
+                else None,
+                "count": int(positions.numel()),
+                "min": int(positions.min().item()) if int(positions.numel()) else None,
+                "max": int(positions.max().item()) if int(positions.numel()) else None,
+                "tail": [
+                    int(pos)
+                    for pos in positions[-8:].detach().cpu().tolist()
+                ],
+            }
+            for idx, positions in enumerate(selected_positions[:4])
+        ]
         state["kv_indptr"] = kv_indptr
         state["kv_indices"] = kv_indices
         state["selection_importance"] = selection_importance
@@ -104,6 +159,7 @@ class SelectOp(BaseSparseOp):
                     int(chunk_ids.numel()) for chunk_ids in selected_chunk_ids
                 ),
             }
+        timing.finish(state)
         return selected_positions
 
     def _chunk_ids_for_positions(
@@ -127,6 +183,7 @@ class SelectOp(BaseSparseOp):
         request_index: int,
         req_pool_idx: int,
         seq_len: int,
+        timing=None,
     ) -> list[int]:
         per_spec_positions = []
         contribution_stats = {
@@ -143,6 +200,7 @@ class SelectOp(BaseSparseOp):
         }
         importance_by_position = {}
         for spec in specs:
+            spec_start = timing.start() if timing is not None else 0.0
             if isinstance(spec, FixedSelectionSpec):
                 positions = self._fixed_positions(spec, seq_len)
                 per_spec_positions.append(positions)
@@ -151,6 +209,13 @@ class SelectOp(BaseSparseOp):
                     {pos: 1.0 for pos in positions},
                 )
                 contribution_stats["fixed"] += len(set(positions))
+                if timing is not None:
+                    timing.add(
+                        "spec_fixed",
+                        spec_start,
+                        request_index=request_index,
+                        count=len(positions),
+                    )
             elif isinstance(spec, SlidingWindowSelectionSpec):
                 window = max(0, int(spec.window_size))
                 start = max(0, seq_len - window)
@@ -164,6 +229,14 @@ class SelectOp(BaseSparseOp):
                     },
                 )
                 contribution_stats["window"] += len(set(positions))
+                if timing is not None:
+                    timing.add(
+                        "spec_sliding_window",
+                        spec_start,
+                        request_index=request_index,
+                        count=len(positions),
+                        window=window,
+                    )
             elif isinstance(spec, HeavyHitterSelectionSpec):
                 positions, priority = self._heavy_hitter_positions(
                     spec,
@@ -173,6 +246,13 @@ class SelectOp(BaseSparseOp):
                 )
                 per_spec_positions.append(positions)
                 self._merge_importance(importance_by_position, priority)
+                if timing is not None:
+                    timing.add(
+                        "spec_heavy_hitter",
+                        spec_start,
+                        request_index=request_index,
+                        count=len(positions),
+                    )
             elif isinstance(spec, RetrievalSelectionSpec):
                 positions, stats, priority = self._retrieval_positions(
                     spec,
@@ -180,6 +260,7 @@ class SelectOp(BaseSparseOp):
                     request_index=request_index,
                     req_pool_idx=req_pool_idx,
                     seq_len=seq_len,
+                    timing=timing,
                 )
                 per_spec_positions.append(positions)
                 self._merge_importance(importance_by_position, priority)
@@ -190,6 +271,16 @@ class SelectOp(BaseSparseOp):
                 contribution_stats["retrieval_budget"] += int(stats.get("budget", 0))
                 contribution_stats["retrieval_middle"] += int(stats.get("middle", 0))
                 contribution_stats["retrieval_method"] = stats.get("method")
+                if timing is not None:
+                    timing.add(
+                        "spec_retrieval",
+                        spec_start,
+                        request_index=request_index,
+                        count=len(positions),
+                        method=stats.get("method"),
+                        budget=int(stats.get("budget", 0)),
+                        middle=int(stats.get("middle", 0)),
+                    )
             elif isinstance(spec, CustomSelectionSpec):
                 positions, priority = self._custom_positions(
                     spec,
@@ -200,7 +291,23 @@ class SelectOp(BaseSparseOp):
                 )
                 per_spec_positions.append(positions)
                 self._merge_importance(importance_by_position, priority)
+                if timing is not None:
+                    timing.add(
+                        "spec_custom",
+                        spec_start,
+                        request_index=request_index,
+                        count=len(positions),
+                    )
+        combine_start = timing.start() if timing is not None else 0.0
         positions = self._combine_positions(per_spec_positions, combine, seq_len)
+        if timing is not None:
+            timing.add(
+                "combine_positions",
+                combine_start,
+                request_index=request_index,
+                count=len(positions),
+                combine=combine,
+            )
         contribution_stats["final"] = len(positions)
         self._last_contribution_stats = contribution_stats
         self._last_selection_importance = {
@@ -347,6 +454,7 @@ class SelectOp(BaseSparseOp):
         request_index: int,
         req_pool_idx: int,
         seq_len: int,
+        timing=None,
     ) -> tuple[list[int], dict, dict[int, float]]:
         framework_state = ctx.framework_state
         if framework_state is None:
@@ -362,9 +470,30 @@ class SelectOp(BaseSparseOp):
             request_index=request_index,
             req_pool_idx=req_pool_idx,
             seq_len=seq_len,
+            timing=timing,
         )
         return (
             positions,
             dict(getattr(selector, "last_stats", {})),
             dict(getattr(selector, "last_priority", {})),
         )
+
+
+class _SelectTiming:
+    def __init__(self, *, enabled: bool):
+        self.enabled = enabled
+        self.items = []
+
+    def start(self) -> float:
+        return time.perf_counter() if self.enabled else 0.0
+
+    def add(self, name: str, start: float, **fields) -> None:
+        if not self.enabled:
+            return
+        item = {"name": name, "ms": round((time.perf_counter() - start) * 1000, 3)}
+        item.update(fields)
+        self.items.append(item)
+
+    def finish(self, state: dict) -> None:
+        if self.enabled:
+            state["select_timing_ms"] = self.items

@@ -506,6 +506,9 @@ class AttendOp(BaseSparseOp):
             missing_positions = [
                 int(pos) for pos in fetch_positions if int(pos) not in cpu_position_set
             ]
+            if missing_positions and h2d_event is not None:
+                self._wait_event(h2d_event, device=k_cache.device)
+                h2d_event = None
         elif store is not None and fetch_positions:
             get_many_chunked_async = getattr(store, "get_many_chunked_async", None)
             if (

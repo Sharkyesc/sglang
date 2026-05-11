@@ -53,7 +53,10 @@ class PlanCompiler:
             working_set_budget_tokens=self.config.working_set_budget_tokens,
             enable_host_backup_on_evict=self.config.enable_host_backup_on_evict,
             enable_physical_eviction=self.config.enable_physical_eviction,
+            physical_eviction_interval=self.config.physical_eviction_interval,
+            physical_eviction_slack_tokens=self.config.physical_eviction_slack_tokens,
             validate_kv_cache=self.config.validate_kv_cache,
+            debug_timing=self.config.debug_timing,
             chunk_size=self.config.chunk_size,
         )
         self._infer_strategy(execution_plan)
@@ -70,10 +73,11 @@ class PlanCompiler:
                     RemapOp(),
                     AttendOp(mode="subset_decode"),
                     ScoreUpdateOp(),
-                    LookaheadPrefetchOp(),
                     EvictOp(),
                     FallbackOp(reason="subset_decode_unavailable"),
                 ]
+                if self.config.enable_lookahead_prefetch:
+                    execution_plan.ops.insert(-2, LookaheadPrefetchOp())
             else:
                 execution_plan.ops = [
                     SelectOp(),
